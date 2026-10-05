@@ -72,6 +72,36 @@ rsite doctor     # 诊断
 
 「只有自己能用代理」靠的是 UUID + shortId + 私钥，这三样不要外传。
 
+## 常见问题
+
+### 报错 `9109: Cannot use the access token from location: x.x.x.x`
+
+```
+[错误] Cloudflare API 返回错误: 9109: Cannot use the access token from location: 203.0.113.10
+```
+
+Token 本身没问题（复制粘贴也没问题），是这个 Token 设置了「客户端 IP 地址筛选」，而报错里的 IP（当前 VPS 的出口 IP）不在名单里。
+
+1. CF「我的个人资料 → API 令牌」→ 找到该 Token →「编辑」。
+2. 在「客户端 IP 地址筛选」里加入报错中的 IP；VPS 有 IPv6 的话把 IPv6 也加上，否则 acme.sh 走 IPv6 签证书时会报同样的错。
+3. 点「继续以显示摘要」→「更新令牌」，**不点更新不会生效**。
+4. 回到 VPS 重新运行 `rsite install`，粘贴同一个 Token 即可，不需要新建。
+
+每新增一台 VPS 都要补一次 IP。也可以删掉 IP 筛选、只保留「区域资源只授权该主域名」，更省事，但 Token 泄露后任何地方都能改该域名的 DNS。
+
+### 新 VPS、主域名不变，要不要新建 Token？
+
+不用，同一个 Token 可以用在同一主域名（CF 同一区域）下的任意子域名和任意 VPS 上。注意：
+
+- 新 VPS 上 acme.sh 还没保存过 Token，第一次部署要输入一次；之后自动续签用本机保存的那份。
+- CF 只在创建时显示一次完整 Token。没留底的话，可在已部署的 VPS 上查：`grep SAVED_CF_Token ~/.acme.sh/account.conf`。不要为此去点「轮换」，轮换后旧值立即失效，已部署机器的自动续签会失败。
+- 设置了 IP 筛选的，先把新 VPS 的 IP 加进去（见上一条）。
+- 每台 VPS 用不同的子域名；两台用同一个子域名时，A 记录会被改到新 IP，旧节点就连不上了。
+
+### Token 看不到区域（`count:0`）
+
+检查 Token 的「区域资源」是否包含该主域名所在区域，以及在 CF 上编辑后是否点了「更新令牌」保存。
+
 ## 附带：麻将连连看
 
 [`lianliankan.html`](lianliankan.html) 是一个单文件、无依赖的麻将连连看小游戏（万 / 筒 / 条 / 风 / 箭，三档难度，提示、重排、最佳用时）。可以直接用浏览器打开，也可以放进伪装站目录作为一个页面：
