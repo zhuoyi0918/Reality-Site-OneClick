@@ -14,7 +14,7 @@ SNI 与证书都是你自己的域名，完全一致。
 ## 安装
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/zhuoyi0918/Reality-Site-OneClick/main/rsite.sh
+curl -fsSLO https://github.com/zhuoyi0918/Reality-Site-OneClick/releases/latest/download/rsite.sh
 sudo bash rsite.sh
 ```
 
@@ -77,7 +77,7 @@ rsite doctor     # 诊断
 [`lianliankan.html`](lianliankan.html) 是一个单文件、无依赖的麻将连连看小游戏（万 / 筒 / 条 / 风 / 箭，三档难度，提示、重排、最佳用时）。可以直接用浏览器打开，也可以放进伪装站目录作为一个页面：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhuoyi0918/Reality-Site-OneClick/main/lianliankan.html \
+curl -fsSL https://github.com/zhuoyi0918/Reality-Site-OneClick/releases/latest/download/lianliankan.html \
   -o /var/www/123456/lianliankan.html
 ```
 
