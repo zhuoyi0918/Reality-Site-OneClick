@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.0.3"
+RSITE_VERSION="1.1.0"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -1045,12 +1045,53 @@ abuse_menu() {
 # -----------------------------------------------------------------------------
 ssh_port_now() { sshd -T 2>/dev/null | awk '/^port /{print $2; exit}'; }
 
+# 判断服务器所在区域：返回 cn 或 oversea（结果缓存）
+GEO_REGION=""
+geo_region() {
+  if [ -n "$GEO_REGION" ]; then printf '%s' "$GEO_REGION"; return; fi
+  local loc=""
+  loc="$(curl -s --max-time 6 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | sed -nE 's/^loc=//p' | tr -d '[:space:]')"
+  [ -n "$loc" ] || loc="$(curl -s --max-time 6 https://ipinfo.io/country 2>/dev/null | tr -d '[:space:]')"
+  if [ "$loc" = CN ]; then GEO_REGION=cn; else GEO_REGION=oversea; fi
+  printf '%s' "$GEO_REGION"
+}
+region_label() { [ "$(geo_region)" = cn ] && printf '国内' || printf '海外'; }
+
+# 生成 ed25519 密钥并写入 authorized_keys；私钥仅显示一次
+ssh_gen_key() {
+  apt_install openssh-client >/dev/null 2>&1 || true
+  command -v ssh-keygen >/dev/null 2>&1 || { err "缺少 ssh-keygen"; return 1; }
+  local kf=/root/.ssh/rsite_ed25519
+  mkdir -p /root/.ssh && chmod 700 /root/.ssh
+  if [ -f "$kf" ]; then
+    warn "已存在 $kf，复用它（不覆盖）"
+  else
+    ssh-keygen -t ed25519 -N '' -C "rsite-$(date +%Y%m%d)" -f "$kf" >/dev/null || { err "生成密钥失败"; return 1; }
+  fi
+  touch /root/.ssh/authorized_keys
+  grep -qxF "$(cat "$kf.pub")" /root/.ssh/authorized_keys 2>/dev/null || cat "$kf.pub" >>/root/.ssh/authorized_keys
+  chmod 600 /root/.ssh/authorized_keys
+  ok "已生成/写入密钥：$kf（公钥已加入 authorized_keys）"
+  line
+  warn "下面是【私钥】，只显示这一次，请完整复制保存到本地（含首尾两行）："
+  msg "本地保存为 id_ed25519 后： chmod 600 id_ed25519 && ssh -i id_ed25519 -p <端口> root@${SERVER_IP:-服务器IP}"
+  line
+  cat "$kf"
+  line
+  return 0
+}
+
 harden_ssh() {
   local cur newp; cur="$(ssh_port_now)"; cur="${cur:-22}"
   warn "修改前请确认：你已能用【密钥】登录本机。关闭密码登录后只能用密钥。"
   if [ ! -s /root/.ssh/authorized_keys ] && ! ls /home/*/.ssh/authorized_keys >/dev/null 2>&1; then
-    err "没有找到任何 authorized_keys，关闭密码登录会把你锁在外面。已中止。"
-    return 1
+    warn "没有找到任何 authorized_keys。"
+    if confirm "现在生成一把新密钥并写入（否则中止）？" y; then
+      ssh_gen_key || return 1
+      confirm "私钥已显示并保存好了吗？继续将关闭密码登录" n || { warn "已中止，未改动 SSH"; return 0; }
+    else
+      err "没有密钥，关闭密码登录会把你锁在外面。已中止。"; return 1
+    fi
   fi
   while :; do ask newp "SSH 端口" "$cur"; valid_port "$newp" && break; done
   confirm "SSH 端口 ${newp}，仅密钥登录，root 仅允许密钥。确定应用？" n || return 0
@@ -1097,22 +1138,204 @@ harden_bbr() {
   ok "当前拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control) / $(sysctl -n net.core.default_qdisc)"
 }
 
+# TCP / 内核参数调优（含 BBR+fq、缓冲区、fast open、连接数、文件句柄）
+harden_tcp() {
+  cat >/etc/sysctl.d/99-rsite-tcp.conf <<'EOF'
+# rsite TCP / network tuning
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.rmem_max=33554432
+net.core.wmem_max=33554432
+net.core.netdev_max_backlog=32768
+net.core.somaxconn=8192
+net.ipv4.tcp_rmem=4096 87380 33554432
+net.ipv4.tcp_wmem=4096 65536 33554432
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_syncookies=1
+net.ipv4.tcp_max_syn_backlog=8192
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+net.ipv4.ip_local_port_range=1024 65535
+fs.file-max=1048576
+EOF
+  sysctl --system >/dev/null 2>&1
+  if [ -d /etc/security/limits.d ]; then
+    printf '* soft nofile 1048576\n* hard nofile 1048576\nroot soft nofile 1048576\nroot hard nofile 1048576\n' \
+      >/etc/security/limits.d/99-rsite.conf
+  fi
+  ok "TCP/内核参数已优化（BBR+fq、缓冲区、TFO、句柄上限）。部分 limits 需重新登录生效。"
+  msg "拥塞控制: $(sysctl -n net.ipv4.tcp_congestion_control) / $(sysctl -n net.core.default_qdisc)"
+}
+
+# 系统更新源：海外用官方源，国内换阿里云镜像（自动按地区；已备份可回滚）
+harden_mirror() {
+  command -v apt-get >/dev/null 2>&1 || { err "仅支持 Debian/Ubuntu"; return 1; }
+  local id codename region mirror
+  id=debian; codename=""
+  if [ -r /etc/os-release ]; then . /etc/os-release; id="${ID:-debian}"; codename="${VERSION_CODENAME:-}"; fi
+  [ -n "$codename" ] || { err "无法识别系统版本代号，已跳过"; return 1; }
+  region="$(geo_region)"
+  if [ "$region" = cn ]; then mirror=aliyun; else mirror=official; fi
+  msg "系统: ${id} ${codename}，地区: $(region_label)，将使用：${mirror} 源"
+  confirm "切换更新源？（原文件会备份）" y || return 0
+  local bk; bk="$RSITE_BACKUP/apt-$(date +%s)"; mkdir -p "$bk"
+  cp -a /etc/apt/sources.list "$bk/" 2>/dev/null || true
+  cp -a /etc/apt/sources.list.d "$bk/" 2>/dev/null || true
+  local base sec
+  if [ "$id" = ubuntu ]; then
+    [ "$mirror" = aliyun ] && base="http://mirrors.aliyun.com/ubuntu" || base="http://archive.ubuntu.com/ubuntu"
+    _write_apt_ubuntu "$base" "$codename"
+  else
+    if [ "$mirror" = aliyun ]; then base="http://mirrors.aliyun.com/debian"; sec="http://mirrors.aliyun.com/debian-security"
+    else base="http://deb.debian.org/debian"; sec="http://security.debian.org/debian-security"; fi
+    _write_apt_debian "$base" "$sec" "$codename"
+  fi
+  if DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1; then
+    ok "更新源已切换为 ${mirror}，apt update 成功"
+  else
+    err "apt update 失败，正在回滚..."
+    rm -f /etc/apt/sources.list; cp -a "$bk/sources.list" /etc/apt/ 2>/dev/null || true
+    rm -rf /etc/apt/sources.list.d; cp -a "$bk/sources.list.d" /etc/apt/ 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1
+    warn "已回滚到原更新源（备份在 $bk）"
+    return 1
+  fi
+}
+
+_write_apt_ubuntu() {
+  local base="$1" cn="$2"
+  if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
+    cat >/etc/apt/sources.list.d/ubuntu.sources <<EOF
+Types: deb
+URIs: ${base}
+Suites: ${cn} ${cn}-updates ${cn}-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: ${base}
+Suites: ${cn}-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+EOF
+    : >/etc/apt/sources.list
+  else
+    cat >/etc/apt/sources.list <<EOF
+deb ${base} ${cn} main restricted universe multiverse
+deb ${base} ${cn}-updates main restricted universe multiverse
+deb ${base} ${cn}-backports main restricted universe multiverse
+deb ${base} ${cn}-security main restricted universe multiverse
+EOF
+  fi
+}
+
+_write_apt_debian() {
+  local base="$1" sec="$2" cn="$3"
+  if [ -f /etc/apt/sources.list.d/debian.sources ]; then
+    cat >/etc/apt/sources.list.d/debian.sources <<EOF
+Types: deb
+URIs: ${base}
+Suites: ${cn} ${cn}-updates ${cn}-backports
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: ${sec}
+Suites: ${cn}-security
+Components: main contrib non-free non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+EOF
+    : >/etc/apt/sources.list
+  else
+    cat >/etc/apt/sources.list <<EOF
+deb ${base} ${cn} main contrib non-free non-free-firmware
+deb ${base} ${cn}-updates main contrib non-free non-free-firmware
+deb ${sec} ${cn}-security main contrib non-free non-free-firmware
+EOF
+  fi
+}
+
+# 更新系统到最新
+harden_update() {
+  msg "更新软件包列表并升级到最新..."
+  DEBIAN_FRONTEND=noninteractive apt-get update >/dev/null 2>&1 || { err "apt update 失败"; return 1; }
+  DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade || { err "升级失败"; return 1; }
+  apt_install unattended-upgrades >/dev/null 2>&1 && \
+    dpkg-reconfigure -f noninteractive unattended-upgrades >/dev/null 2>&1 || true
+  ok "系统已更新到最新，并已开启自动安全更新"
+  [ -f /var/run/reboot-required ] && warn "内核/核心组件已更新，建议重启：reboot"
+}
+
+# 清理系统垃圾文件
+harden_clean() {
+  local before after freed
+  before="$(df -k / | awk 'NR==2{print $4}')"
+  msg "清理 apt 缓存、无用依赖、日志、临时文件..."
+  DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -y autoclean >/dev/null 2>&1 || true
+  DEBIAN_FRONTEND=noninteractive apt-get -y clean >/dev/null 2>&1 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl --rotate >/dev/null 2>&1 || true
+    journalctl --vacuum-time=3d >/dev/null 2>&1 || true
+  fi
+  rm -rf /tmp/* /var/tmp/* 2>/dev/null || true
+  find /var/log -type f \( -name '*.gz' -o -name '*.1' -o -name '*.old' \) -delete 2>/dev/null || true
+  after="$(df -k / | awk 'NR==2{print $4}')"
+  freed=$(( (after-before)/1024 ))
+  ok "清理完成，根分区约释放 ${freed} MB（当前可用 $(( after/1024 )) MB）"
+}
+
+# 自动优化 DNS：海外 1.1.1.1 / 8.8.8.8，国内 223.5.5.5 / 223.6.6.6
+harden_dns() {
+  local region servers sv
+  region="$(geo_region)"
+  if [ "$region" = cn ]; then servers="223.5.5.5 223.6.6.6"; else servers="1.1.1.1 8.8.8.8"; fi
+  msg "检测到服务器位于：$(region_label)，将设置 DNS：${servers}"
+  confirm "应用 DNS？" y || return 0
+  if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+    mkdir -p /etc/systemd/resolved.conf.d
+    { echo "[Resolve]"; echo "DNS=${servers}"; echo "FallbackDNS=1.1.1.1 8.8.8.8"; } >/etc/systemd/resolved.conf.d/rsite.conf
+    systemctl restart systemd-resolved
+    ok "已通过 systemd-resolved 设置 DNS：${servers}"
+  else
+    cp -a /etc/resolv.conf "$RSITE_BACKUP/resolv.conf.$(date +%s)" 2>/dev/null || true
+    chattr -i /etc/resolv.conf 2>/dev/null || true
+    [ -L /etc/resolv.conf ] && rm -f /etc/resolv.conf
+    : >/etc/resolv.conf
+    for sv in $servers; do echo "nameserver $sv" >>/etc/resolv.conf; done
+    ok "已写入 /etc/resolv.conf：${servers}"
+    warn "若面板/DHCP 会覆盖 resolv.conf，请在面板里改，或自行 chattr +i 锁定"
+  fi
+}
+
 harden_menu() {
-  title "系统加固（可选，按需执行）"
-  msg "  1) 系统更新 + 自动安全更新（apt full-upgrade, unattended-upgrades）"
-  msg "  2) SSH：改端口 + 仅密钥登录"
-  msg "  3) UFW 防火墙（只开 SSH / 80 / Reality 端口）"
-  msg "  4) fail2ban（sshd）"
-  msg "  5) 开启 BBR + fq"
+  title "系统优化 / 加固（可选，按需执行）"
+  msg "  1) 更新系统到最新 + 自动安全更新"
+  msg "  2) 优化更新源（按地区：海外官方 / 国内阿里云镜像）"
+  msg "  3) 清理系统垃圾文件"
+  msg "  4) 自动优化 DNS（海外 1.1.1.1/8.8.8.8，国内 223.5.5.5）"
+  msg "  5) TCP / 内核参数调优（含 BBR+fq）"
+  msg "  6) SSH：改端口 + 生成密钥 + 仅密钥登录"
+  msg "  7) UFW 防火墙（只开 SSH / 80 / Reality 端口）"
+  msg "  8) fail2ban（sshd）"
+  msg "  9) 仅开启 BBR + fq"
   msg "  0) 返回"
-  local c; ask c "请选择 [0-5]" ""
+  local c; ask c "请选择 [0-9]" ""
   case "$c" in
-    1) DEBIAN_FRONTEND=noninteractive apt-get update && DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade \
-         && apt_install unattended-upgrades && ok "系统已更新" ;;
-    2) harden_ssh ;;
-    3) harden_ufw ;;
-    4) harden_f2b ;;
-    5) harden_bbr ;;
+    1) harden_update ;;
+    2) harden_mirror ;;
+    3) harden_clean ;;
+    4) harden_dns ;;
+    5) harden_tcp ;;
+    6) harden_ssh ;;
+    7) harden_ufw ;;
+    8) harden_f2b ;;
+    9) harden_bbr ;;
   esac
 }
 
@@ -1166,7 +1389,7 @@ main_menu() {
     msg "  5) 证书管理"
     msg "  6) 服务管理"
     msg "  7) 防偷跑 / 访问统计"
-    msg "  8) 系统加固（SSH / UFW / fail2ban / BBR）"
+    msg "  8) 系统优化 / 加固（更新源/DNS/TCP/SSH/UFW/BBR）"
     msg "  9) 卸载"
     msg "  0) 退出"
     msg ""
