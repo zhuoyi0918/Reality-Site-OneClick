@@ -39,7 +39,7 @@ rsite doctor     # 诊断
 
 | 步骤 | 内容 |
 |---|---|
-| 1 | 域名（如 `thoracic.example.com`） |
+| 1 | 域名（如 `123456.example.com`） |
 | 2 | CF Token（不回显，自动查找所属区域；已有有效证书时可跳过） |
 | 3 | VPS 公网 IPv4（自动探测）、Reality 端口（默认 443）、nginx 回落端口（默认 8443） |
 | 4 | UUID / shortId / fingerprint / 节点名（回车自动生成） |
@@ -78,9 +78,9 @@ rsite doctor     # 诊断
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhuoyi0918/Reality-Site-OneClick/main/lianliankan.html \
-  -o /var/www/thoracic/lianliankan.html
+  -o /var/www/123456/lianliankan.html
 ```
 
 ## 网站内容建议
 
-纯静态 HTML/CSS，不放大文件或视频；不放预约或问诊表单，不收集个人信息；只做科普，不写疗效承诺。
+纯静态 HTML/CSS，不放大文件或视频。
