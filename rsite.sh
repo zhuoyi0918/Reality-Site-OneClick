@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.1.0"
+RSITE_VERSION="1.2.0"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -1349,6 +1349,10 @@ uninstall() {
   msg "保留：nginx 软件包、UFW 规则、SSH 设置、网站目录（会单独询问）。"
   confirm "确定卸载？" n || return 0
   systemctl disable --now xray >/dev/null 2>&1
+  # 一并清理其他协议（若存在）
+  systemctl disable --now "$VENC_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${VENC_SVC}.service"; rm -rf "$VENC_DIR" "$VENC_STATE" "${RSITE_DIR}/venc-link.txt"
+  systemctl disable --now "$MIERU_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${MIERU_SVC}.service"; rm -rf "$MIERU_DIR" "$MIERU_STATE" "${RSITE_DIR}/mieru-link.txt"
+  systemctl daemon-reload 2>/dev/null || true
   bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ remove --purge >/dev/null 2>&1 || rm -f "$XRAY_BIN"
   rm -f "$NGINX_CONF"
   if [ -f "$RSITE_BACKUP/nginx-sites-enabled-default" ] && [ ! -e /etc/nginx/sites-enabled/default ]; then
@@ -1362,9 +1366,369 @@ uninstall() {
   if [ -n "$WEBROOT" ] && [ -d "$WEBROOT" ] && confirm "同时删除网站目录 ${WEBROOT}？" n; then rm -rf "$WEBROOT"; fi
   rm -rf "$RSITE_DIR"; rm -f "$RSITE_BIN"
   if [ -L "$RL_BIN" ] && [ "$(readlink "$RL_BIN")" = "$RSITE_BIN" ]; then rm -f "$RL_BIN"; fi
-  if [ -L "$RL_BIN" ] && [ "$(readlink "$RL_BIN")" = "$RSITE_BIN" ]; then rm -f "$RL_BIN"; fi
   ok "已卸载。Cloudflare 上的 DNS 记录和 Token 请自行处理（建议在 CF 轮换/删除 Token）。"
   exit 0
+}
+
+# =============================================================================
+#  其他协议：VLESS Encryption（mlkem768x25519plus，无流控）与 mieru
+#  （由 rsite 追加；与 Reality 节点各自独立，互不影响）
+# =============================================================================
+MITA_BIN="/usr/local/bin/mita"
+MIERU_DIR="${RSITE_DIR}/mieru"
+MIERU_STATE="${RSITE_DIR}/mieru.env"
+MIERU_CONF="${MIERU_DIR}/server.json"
+MIERU_UDS="/run/rsite-mita.sock"
+MIERU_SVC="rsite-mita"
+MIERU_REPO="enfein/mieru"
+VENC_STATE="${RSITE_DIR}/venc.env"
+VENC_DIR="/usr/local/etc/xray-venc"
+VENC_CONF="${VENC_DIR}/config.json"
+VENC_SVC="xray-venc"
+VENC_KEX="mlkem768x25519plus"
+
+# ---------------------------------------------------------------- VLESS Encryption
+VENC_KEYS="VENC_PORT VENC_UUID VENC_AUTH VENC_MODE VENC_PRIV VENC_CLIENT VENC_NODE VENC_ADDR VENC_BLOCK_CN"
+venc_defaults() {
+  VENC_PORT="2443"; VENC_UUID=""; VENC_AUTH="x25519"; VENC_MODE="native"
+  VENC_PRIV=""; VENC_CLIENT=""; VENC_NODE="VLESS-ENC"; VENC_ADDR=""; VENC_BLOCK_CN="yes"
+}
+venc_load() {
+  venc_defaults; [ -f "$VENC_STATE" ] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case " $VENC_KEYS " in *" $k "*) ;; *) continue ;; esac
+    v="${v#\'}"; v="${v%\'}"; printf -v "$k" '%s' "$v"
+  done <"$VENC_STATE"; return 0
+}
+venc_save() {
+  mkdir -p "$RSITE_DIR" && chmod 700 "$RSITE_DIR"
+  local k tmp="${VENC_STATE}.tmp"; : >"$tmp" && chmod 600 "$tmp"
+  for k in $VENC_KEYS; do printf "%s='%s'\n" "$k" "${!k}" >>"$tmp"; done
+  mv -f "$tmp" "$VENC_STATE"
+}
+venc_deployed() { [ -f "$VENC_STATE" ] && [ -f "$VENC_CONF" ] && [ -x "$XRAY_BIN" ]; }
+
+# 生成 server decryption / client encryption 串
+venc_dec() { printf '%s.%s.600s.%s' "$VENC_KEX" "$VENC_MODE" "$VENC_PRIV"; }
+venc_enc() { printf '%s.%s.0rtt.%s' "$VENC_KEX" "$VENC_MODE" "$VENC_CLIENT"; }
+
+# venc_keygen：按 VENC_AUTH 生成，结果写入 VENC_PRIV / VENC_CLIENT
+venc_keygen() {
+  local out priv cli
+  [ -x "$XRAY_BIN" ] || return 1
+  out="$("$XRAY_BIN" "$VENC_AUTH" 2>/dev/null)" || return 1
+  case "$VENC_AUTH" in
+    x25519)
+      priv="$(sed -nE 's/^(PrivateKey|Private key):[[:space:]]*//p' <<<"$out" | head -n1 | tr -d '\r ')"
+      cli="$(sed -nE 's/^(Password \(PublicKey\)|Public key|Password):[[:space:]]*//p' <<<"$out" | head -n1 | tr -d '\r ')" ;;
+    mlkem768)
+      priv="$(sed -nE 's/^Seed:[[:space:]]*//p' <<<"$out" | head -n1 | tr -d '\r ')"
+      cli="$(sed -nE 's/^Client:[[:space:]]*//p' <<<"$out" | head -n1 | tr -d '\r ')" ;;
+    *) return 1 ;;
+  esac
+  [ -n "$priv" ] && [ -n "$cli" ] || return 1
+  VENC_PRIV="$priv"; VENC_CLIENT="$cli"
+}
+
+venc_gen_config() {
+  mkdir -p "$VENC_DIR"
+  jq -n --argjson port "$VENC_PORT" --arg uuid "$VENC_UUID" --arg email "$VENC_NODE" \
+     --arg dec "$(venc_dec)" --argjson cn "$([ "$VENC_BLOCK_CN" = yes ] && echo true || echo false)" '
+  {
+    log:{loglevel:"warning", access:"none"},
+    inbounds:[{
+      tag:"venc-in", listen:"0.0.0.0", port:$port, protocol:"vless",
+      settings:{clients:[{id:$uuid, email:$email}], decryption:$dec},
+      streamSettings:{network:"tcp", security:"none"},
+      sniffing:{enabled:true, destOverride:["http","tls","quic"], routeOnly:true}
+    }],
+    outbounds:[{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
+    routing:{domainStrategy:"AsIs", rules:(
+      [{type:"field",ip:["geoip:private"],outboundTag:"block"},
+       {type:"field",protocol:["bittorrent"],outboundTag:"block"}]
+      + (if $cn then [{type:"field",ip:["geoip:cn"],outboundTag:"block"}] else [] end))}
+  }' >"${VENC_CONF}.tmp" || return 1
+  mv -f "${VENC_CONF}.tmp" "$VENC_CONF"
+}
+
+venc_write_service() {
+  cat >/etc/systemd/system/${VENC_SVC}.service <<EOF
+[Unit]
+Description=Xray VLESS-Encryption (rsite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} run -c ${VENC_CONF}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+venc_link() {
+  printf 'vless://%s@%s:%s?encryption=%s&security=none&type=tcp&headerType=none#%s' \
+    "$VENC_UUID" "$(link_host "$VENC_ADDR")" "$VENC_PORT" "$(urlenc "$(venc_enc)")" "$(urlenc "$VENC_NODE")"
+}
+
+venc_show() {
+  venc_load || { warn "尚未部署 VLESS Encryption"; return 1; }
+  local link; link="$(venc_link)"
+  title "VLESS Encryption 节点"
+  kv "节点名" "$VENC_NODE" "连接地址" "$VENC_ADDR" "端口" "$VENC_PORT" \
+     "UUID" "$VENC_UUID" "认证/外观" "${VENC_AUTH} / ${VENC_MODE}" "传输/安全" "tcp / none（无 TLS）"
+  line
+  msg "${C_W}VLESS 链接：${C_0}"; msg "${C_G}${link}${C_0}"
+  line
+  command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 -m 1 "$link"
+  line
+  msg "${C_W}Xray 客户端 encryption 字段：${C_0}"; msg "$(venc_enc)"
+  msg "提示：VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+），sing-box 暂不支持。"
+  ( umask 077; printf '%s\n' "$link" >"${RSITE_DIR}/venc-link.txt" )
+}
+
+venc_deploy() {
+  local reconf=0; venc_load && reconf=1
+  title "部署 VLESS Encryption（mlkem768x25519plus，无流控）"
+  [ -z "$VENC_ADDR" ] && { state_load 2>/dev/null; VENC_ADDR="${CONNECT_ADDR:-${SERVER_IP:-$(detect_ip || true)}}"; }
+  while :; do ask VENC_PORT "对外端口" "$VENC_PORT"; valid_port "$VENC_PORT" && break; warn "端口无效"; done
+  while :; do
+    ask VENC_ADDR "客户端连接地址（IP 或域名）" "$VENC_ADDR"
+    valid_ipv4 "$VENC_ADDR" || valid_ipv6 "$VENC_ADDR" || valid_domain "$VENC_ADDR" && break; warn "地址无效"
+  done
+  local tmp
+  ask tmp "认证密钥类型 1) x25519（默认，短） 2) mlkem768（抗量子，客户端串很长）" "$(case "$VENC_AUTH" in mlkem768) echo 2;; *) echo 1;; esac)"
+  case "$tmp" in 2) VENC_AUTH=mlkem768;; *) VENC_AUTH=x25519;; esac
+  ask VENC_NODE "节点名称" "$VENC_NODE"; valid_name "$VENC_NODE" || VENC_NODE="VLESS-ENC"
+  confirm "拦截回国流量 geoip:cn？" "$([ "$VENC_BLOCK_CN" = yes ] && echo y || echo n)" && VENC_BLOCK_CN=yes || VENC_BLOCK_CN=no
+  confirm "开始部署 VLESS Encryption（端口 ${VENC_PORT}）？" y || return 0
+
+  install_xray || return 1
+  [ -z "$VENC_UUID" ] && VENC_UUID="$(gen_uuid)"
+  venc_keygen || { err "生成密钥失败"; return 1; }
+  venc_gen_config || { err "生成配置失败"; return 1; }
+  if ! "$XRAY_BIN" run -test -c "$VENC_CONF" >/dev/null 2>&1; then
+    err "配置测试失败："; "$XRAY_BIN" run -test -c "$VENC_CONF" 2>&1 | tail -3; return 1
+  fi
+  venc_write_service
+  venc_save
+  systemctl enable "$VENC_SVC" >/dev/null 2>&1
+  systemctl restart "$VENC_SVC" || { err "启动失败: journalctl -u $VENC_SVC -n 30"; return 1; }
+  sleep 1
+  systemctl is-active --quiet "$VENC_SVC" || { err "未运行: journalctl -u $VENC_SVC -n 30"; return 1; }
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${VENC_PORT}/tcp" >/dev/null && ok "UFW 已放行 ${VENC_PORT}/tcp"
+  fi
+  ok "VLESS Encryption 已部署，监听 0.0.0.0:${VENC_PORT}"
+  venc_show
+}
+
+venc_remove() {
+  venc_load || { warn "未部署 VLESS Encryption"; return 0; }
+  confirm "删除 VLESS Encryption 节点（不影响 Reality / mieru）？" n || return 0
+  systemctl disable --now "$VENC_SVC" >/dev/null 2>&1
+  rm -f "/etc/systemd/system/${VENC_SVC}.service"; systemctl daemon-reload
+  rm -rf "$VENC_DIR" "$VENC_STATE" "${RSITE_DIR}/venc-link.txt"
+  ok "已删除 VLESS Encryption"
+}
+
+# ---------------------------------------------------------------- mieru
+MIERU_SKEYS="MIERU_PORT MIERU_USER MIERU_PASS MIERU_MTU MIERU_ADDR"
+mieru_defaults() { MIERU_PORT="2444"; MIERU_USER=""; MIERU_PASS=""; MIERU_MTU="1400"; MIERU_ADDR=""; }
+mieru_load() {
+  mieru_defaults; [ -f "$MIERU_STATE" ] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case " $MIERU_SKEYS " in *" $k "*) ;; *) continue ;; esac
+    v="${v#\'}"; v="${v%\'}"; printf -v "$k" '%s' "$v"
+  done <"$MIERU_STATE"; return 0
+}
+mieru_save() {
+  mkdir -p "$RSITE_DIR" && chmod 700 "$RSITE_DIR"
+  local k tmp="${MIERU_STATE}.tmp"; : >"$tmp" && chmod 600 "$tmp"
+  for k in $MIERU_SKEYS; do printf "%s='%s'\n" "$k" "${!k}" >>"$tmp"; done
+  mv -f "$tmp" "$MIERU_STATE"
+}
+mieru_deployed() { [ -f "$MIERU_STATE" ] && [ -x "$MITA_BIN" ]; }
+
+mieru_arch() { case "$(uname -m)" in x86_64|amd64) printf amd64 ;; aarch64|arm64) printf arm64 ;; *) return 1 ;; esac; }
+mieru_latest_ver() {
+  local v
+  v="$(curl -fsSL --max-time 15 "https://api.github.com/repos/${MIERU_REPO}/releases/latest" 2>/dev/null \
+      | grep -oE '"tag_name"[^,]*' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  [ -n "$v" ] || v="3.36.0"
+  printf '%s' "$v"
+}
+mieru_install_bin() {
+  if [ -x "$MITA_BIN" ] && [ "${1:-}" != upgrade ]; then
+    ok "mita 已安装: $("$MITA_BIN" version 2>/dev/null | head -n1)"; return 0
+  fi
+  local arch ver url tmp
+  arch="$(mieru_arch)" || { err "不支持的架构: $(uname -m)"; return 1; }
+  ver="$(mieru_latest_ver)"
+  url="https://github.com/${MIERU_REPO}/releases/download/v${ver}/mita_${ver}_linux_${arch}.tar.gz"
+  info "下载 mita v${ver}（${arch}）"
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL --max-time 120 "$url" -o "$tmp/m.tgz"; then err "下载失败: $url"; rm -rf "$tmp"; return 1; fi
+  tar xzf "$tmp/m.tgz" -C "$tmp" 2>/dev/null || { err "解压失败"; rm -rf "$tmp"; return 1; }
+  local b; b="$(find "$tmp" -type f -name mita | head -n1)"
+  [ -n "$b" ] || { err "包内未找到 mita"; rm -rf "$tmp"; return 1; }
+  install -m 0755 "$b" "$MITA_BIN"; rm -rf "$tmp"
+  [ -x "$MITA_BIN" ] && ok "mita: $("$MITA_BIN" version 2>/dev/null | head -n1)"
+}
+
+mieru_gen_config() {
+  mkdir -p "$MIERU_DIR" && chmod 700 "$MIERU_DIR"
+  jq -n --argjson port "$MIERU_PORT" --arg user "$MIERU_USER" --arg pass "$MIERU_PASS" --argjson mtu "$MIERU_MTU" '
+  {portBindings:[{port:$port,protocol:"TCP"}],
+   users:[{name:$user,password:$pass}],
+   loggingLevel:"INFO", mtu:$mtu}' >"${MIERU_CONF}.tmp" || return 1
+  mv -f "${MIERU_CONF}.tmp" "$MIERU_CONF"; chmod 600 "$MIERU_CONF"
+}
+
+mieru_write_service() {
+  cat >/etc/systemd/system/${MIERU_SVC}.service <<EOF
+[Unit]
+Description=Mieru mita server (rsite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Environment=MITA_CONFIG_JSON_FILE=${MIERU_CONF}
+Environment=MITA_UDS_PATH=${MIERU_UDS}
+Environment=MITA_INSECURE_UDS=1
+StateDirectory=mita
+ExecStart=${MITA_BIN} run
+ExecStartPost=/bin/sh -c 'for i in \$(seq 1 40); do [ -S "\$MITA_UDS_PATH" ] && break; sleep 0.25; done; "${MITA_BIN}" apply config "\$MITA_CONFIG_JSON_FILE" >/dev/null 2>&1 || true; "${MITA_BIN}" start >/dev/null 2>&1 || true'
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+mieru_link() {
+  printf 'mierus://%s:%s@%s?handshake-mode=HANDSHAKE_NO_WAIT&mtu=%s&multiplexing=MULTIPLEXING_OFF&port=%s&profile=default&protocol=TCP' \
+    "$(urlenc "$MIERU_USER")" "$(urlenc "$MIERU_PASS")" "$(link_host "$MIERU_ADDR")" "$MIERU_MTU" "$MIERU_PORT"
+}
+
+mieru_client_json() {
+  jq -n --arg u "$MIERU_USER" --arg p "$MIERU_PASS" --arg h "$MIERU_ADDR" \
+     --argjson port "$MIERU_PORT" --argjson mtu "$MIERU_MTU" '
+  {profiles:[{profileName:"default",
+     user:{name:$u,password:$p},
+     servers:[{ipAddress:$h,portBindings:[{port:$port,protocol:"TCP"}]}],
+     mtu:$mtu}],
+   activeProfile:"default", rpcPort:8964, socks5Port:1080, loggingLevel:"INFO"}'
+}
+
+mieru_show() {
+  mieru_load || { warn "尚未部署 mieru"; return 1; }
+  local link; link="$(mieru_link)"
+  title "mieru 节点"
+  kv "连接地址" "$MIERU_ADDR" "端口" "$MIERU_PORT" "协议" "TCP" "用户名" "$MIERU_USER" "MTU" "$MIERU_MTU"
+  line
+  msg "${C_W}mierus:// 分享链接：${C_0}"; msg "${C_G}${link}${C_0}"
+  line
+  command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 -m 1 "$link"
+  line
+  msg "${C_W}mieru 客户端 JSON（在电脑/手机 mieru 客户端导入，勿在服务器 mita apply）：${C_0}"
+  mieru_client_json
+  ( umask 077; printf '%s\n' "$link" >"${RSITE_DIR}/mieru-link.txt" )
+  msg ""
+  msg "密码（含在链接中，请妥善保存）：${C_Y}${MIERU_PASS}${C_0}"
+}
+
+mieru_deploy() {
+  mieru_load || true
+  title "部署 mieru"
+  [ -z "$MIERU_ADDR" ] && { state_load 2>/dev/null; MIERU_ADDR="${CONNECT_ADDR:-${SERVER_IP:-$(detect_ip || true)}}"; }
+  while :; do ask MIERU_PORT "对外端口（TCP）" "$MIERU_PORT"; valid_port "$MIERU_PORT" && break; warn "端口无效"; done
+  while :; do
+    ask MIERU_ADDR "客户端连接地址（IP 或域名）" "$MIERU_ADDR"
+    valid_ipv4 "$MIERU_ADDR" || valid_ipv6 "$MIERU_ADDR" || valid_domain "$MIERU_ADDR" && break; warn "地址无效"
+  done
+  ask MIERU_USER "用户名" "${MIERU_USER:-mieru}"; [ -n "$MIERU_USER" ] || MIERU_USER=mieru
+  local defpass="${MIERU_PASS:-$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)}"
+  ask MIERU_PASS "密码（回车用随机）" "$defpass"; [ -n "$MIERU_PASS" ] || MIERU_PASS="$defpass"
+  while :; do ask MIERU_MTU "MTU" "$MIERU_MTU"; [[ "$MIERU_MTU" =~ ^[0-9]+$ ]] && [ "$MIERU_MTU" -ge 1280 ] && [ "$MIERU_MTU" -le 1500 ] && break; warn "MTU 取值 1280-1500"; done
+  confirm "开始部署 mieru（端口 ${MIERU_PORT}/TCP）？" y || return 0
+
+  mieru_install_bin || return 1
+  mieru_gen_config || { err "生成配置失败"; return 1; }
+  mieru_write_service
+  mieru_save
+  systemctl enable "$MIERU_SVC" >/dev/null 2>&1
+  systemctl restart "$MIERU_SVC" || { err "启动失败: journalctl -u $MIERU_SVC -n 30"; return 1; }
+  # 等待 socket 与 RUNNING
+  local i=0 st=""
+  while [ "$i" -lt 20 ]; do [ -S "$MIERU_UDS" ] && break; sleep 0.5; i=$((i+1)); done
+  i=0
+  while [ "$i" -lt 20 ]; do
+    st="$(MITA_CONFIG_JSON_FILE="$MIERU_CONF" MITA_UDS_PATH="$MIERU_UDS" MITA_INSECURE_UDS=1 "$MITA_BIN" status 2>/dev/null || true)"
+    printf '%s' "$st" | grep -q 'RUNNING' && break; sleep 0.5; i=$((i+1))
+  done
+  if ! printf '%s' "$st" | grep -q 'RUNNING'; then
+    err "mita 未进入 RUNNING，查看: journalctl -u $MIERU_SVC -n 40"; return 1
+  fi
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${MIERU_PORT}/tcp" >/dev/null && ok "UFW 已放行 ${MIERU_PORT}/tcp"
+  fi
+  ok "mieru 已部署并 RUNNING，监听 0.0.0.0:${MIERU_PORT}/TCP"
+  mieru_show
+}
+
+mieru_remove() {
+  mieru_load || { warn "未部署 mieru"; return 0; }
+  confirm "删除 mieru 节点（不影响 Reality / VLESS Encryption）？" n || return 0
+  systemctl disable --now "$MIERU_SVC" >/dev/null 2>&1
+  rm -f "/etc/systemd/system/${MIERU_SVC}.service"; systemctl daemon-reload
+  rm -rf "$MIERU_DIR" "$MIERU_STATE" "${RSITE_DIR}/mieru-link.txt"
+  confirm "同时卸载 mita 程序（${MITA_BIN}）？" n && rm -f "$MITA_BIN"
+  ok "已删除 mieru"
+}
+
+# ---------------------------------------------------------------- 子菜单
+other_menu() {
+  while :; do
+    local vs ms
+    vs="$(venc_deployed && systemctl is-active "$VENC_SVC" 2>/dev/null || echo 未部署)"
+    ms="$(mieru_deployed && systemctl is-active "$MIERU_SVC" 2>/dev/null || echo 未部署)"
+    title "其他协议：mieru / VLESS Encryption"
+    msg "VLESS Encryption: ${vs}    mieru: ${ms}"
+    msg ""
+    msg "  1) 部署 / 重装 VLESS Encryption"
+    msg "  2) 查看 VLESS Encryption 链接"
+    msg "  3) 删除 VLESS Encryption"
+    msg "  4) 部署 / 重装 mieru"
+    msg "  5) 查看 mieru 链接"
+    msg "  6) 删除 mieru"
+    msg "  7) 重启两者服务"
+    msg "  0) 返回"
+    local c; ask c "请选择 [0-7]" ""
+    case "$c" in
+      1) venc_deploy ;;
+      2) venc_show ;;
+      3) venc_remove ;;
+      4) mieru_deploy ;;
+      5) mieru_show ;;
+      6) mieru_remove ;;
+      7) systemctl restart "$VENC_SVC" 2>/dev/null; systemctl restart "$MIERU_SVC" 2>/dev/null; ok "已尝试重启" ;;
+      0) return 0 ;;
+      *) warn "无效选择" ;;
+    esac
+    [ "$c" = 0 ] || pause
+  done
 }
 
 # -----------------------------------------------------------------------------
@@ -1390,12 +1754,13 @@ main_menu() {
     msg "  6) 服务管理"
     msg "  7) 防偷跑 / 访问统计"
     msg "  8) 系统优化 / 加固（更新源/DNS/TCP/SSH/UFW/BBR）"
-    msg "  9) 卸载"
+    msg "  9) 其他协议：mieru / VLESS Encryption"
+    msg " 10) 卸载"
     msg "  0) 退出"
     msg ""
     msg "${C_G}下次直接输入 rl 即可调出本菜单${C_0}（等同 rsite）"
     msg "快捷命令: rl link | rl doctor | rl install"
-    local c; ask c "请选择 [0-9]" ""
+    local c; ask c "请选择 [0-10]" ""
     case "$c" in
       1) wizard ;;
       2) show_node ;;
@@ -1405,7 +1770,8 @@ main_menu() {
       6) service_menu ;;
       7) abuse_menu ;;
       8) harden_menu ;;
-      9) uninstall ;;
+      9) other_menu ;;
+      10) uninstall ;;
       0|q|Q) exit 0 ;;
       *) warn "无效选择"; continue ;;
     esac
