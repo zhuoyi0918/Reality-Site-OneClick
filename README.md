@@ -1,6 +1,6 @@
 # Reality-Site-OneClick
 
-nginx 伪装站 + VLESS Reality（**自有域名做 target**）一键部署脚本。终端交互菜单，不依赖 S-UI 等面板。
+nginx 伪装站 + VLESS Reality（**自有域名做 target**）一键部署脚本。终端交互菜单，不依赖 S-UI 等面板。可选在同机加挂 **mieru** 与 **VLESS Encryption** 节点。
 
 输入 Cloudflare Token、域名、IP、端口 → 自动完成 DNS（灰云）→ acme.sh DNS-01 证书 → nginx 回落站 → Xray Reality → 输出 `vless://` 链接、二维码、Mihomo / sing-box 配置。
 
@@ -66,7 +66,12 @@ rsite doctor     # 诊断
    - TCP / 内核参数调优（BBR+fq、缓冲区、TCP Fast Open、连接数、文件句柄上限）
    - SSH：改端口、生成 ed25519 密钥、仅密钥登录（无密钥时可一键生成，私钥仅显示一次）
    - UFW 防火墙、fail2ban、仅开启 BBR
-9. 卸载
+9. 其他协议：mieru / VLESS Encryption（与 Reality 各自独立，互不影响）
+   - VLESS Encryption：Xray `mlkem768x25519plus`（抗量子混合加密，无 TLS、无流控），认证可选 x25519 / mlkem768，输出 `vless://` 链接
+   - mieru：官方 mita 服务端，自定义用户名 / 密码 / MTU，输出 `mierus://` 链接与 mieru 客户端 JSON
+10. 卸载
+
+> 其他协议可与 Reality 共存于同一台机器，各用各的端口与 systemd 服务（`xray-venc`、`rsite-mita`）。VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+，sing-box 暂不支持）。
 
 ## 细节
 
