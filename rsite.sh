@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.0.1"
+RSITE_VERSION="1.0.2"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -622,7 +622,7 @@ apply_xray() {
   if [ -s "$XRAY_CONF" ] && ! cmp -s "$XRAY_CONF" "$RSITE_BACKUP/xray-last.json" 2>/dev/null; then
     cp -f "$XRAY_CONF" "$RSITE_BACKUP/xray-$(date +%Y%m%d-%H%M%S).json"
   fi
-  local tmp="${XRAY_CONF}.rsite.tmp" v tkey lim want_lim=1 out=""
+  local tmp="${RSITE_DIR}/xray-test.json" v tkey lim want_lim=1 out=""
   [ "$LIMIT_FB" = yes ] || want_lim=0
   # 依次尝试：新字段 target → 旧字段 dest；limitFallback 不被支持时自动去掉
   for v in "target:$want_lim" "target:0" "dest:$want_lim" "dest:0"; do
