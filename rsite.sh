@@ -8,7 +8,7 @@
 #
 #  用法:
 #    bash rsite.sh            # 首次运行：安装为 rsite 命令并进入菜单
-#    rsite                    # 交互菜单
+#    rsite  或  rl             # 交互菜单（rl 是 rsite 的短命令）
 #    rsite install            # 直接进入部署向导
 #    rsite link               # 显示节点链接 / 二维码 / Mihomo 配置
 #    rsite doctor             # 诊断
@@ -18,11 +18,12 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.0.2"
+RSITE_VERSION="1.0.3"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
 RSITE_BIN="/usr/local/bin/rsite"
+RL_BIN="/usr/local/bin/rl"   # 短命令：输入 rl 调出菜单
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_CONF="/usr/local/etc/xray/config.json"
 NGINX_CONF="/etc/nginx/conf.d/rsite.conf"
@@ -179,9 +180,20 @@ base_deps() { apt_install curl jq openssl ca-certificates socat cron iproute2 dn
 
 self_install() {
   local src="${BASH_SOURCE[0]:-$0}"
-  [ -f "$src" ] || return 0
-  [ "$(readlink -f "$src")" = "$RSITE_BIN" ] && return 0
-  install -m 755 "$src" "$RSITE_BIN" && ok "已安装管理命令: rsite"
+  if [ -f "$src" ] && [ "$(readlink -f "$src")" != "$RSITE_BIN" ]; then
+    install -m 755 "$src" "$RSITE_BIN" && ok "已安装管理命令: rsite"
+  fi
+  [ -x "$RSITE_BIN" ] && rl_install
+}
+
+# 短命令 rl → rsite（已被其他程序占用时不覆盖）
+rl_install() {
+  if [ -L "$RL_BIN" ] && [ "$(readlink -f "$RL_BIN")" = "$RSITE_BIN" ]; then return 0; fi
+  if [ -e "$RL_BIN" ]; then
+    warn "$RL_BIN 已被其他程序占用，未创建短命令 rl（仍可用 rsite）"
+    return 0
+  fi
+  ln -s "$RSITE_BIN" "$RL_BIN" && ok "已创建短命令: rl（输入 rl 即可调出菜单）"
 }
 
 detect_ip() {
@@ -1126,6 +1138,8 @@ uninstall() {
   fi
   if [ -n "$WEBROOT" ] && [ -d "$WEBROOT" ] && confirm "同时删除网站目录 ${WEBROOT}？" n; then rm -rf "$WEBROOT"; fi
   rm -rf "$RSITE_DIR"; rm -f "$RSITE_BIN"
+  if [ -L "$RL_BIN" ] && [ "$(readlink "$RL_BIN")" = "$RSITE_BIN" ]; then rm -f "$RL_BIN"; fi
+  if [ -L "$RL_BIN" ] && [ "$(readlink "$RL_BIN")" = "$RSITE_BIN" ]; then rm -f "$RL_BIN"; fi
   ok "已卸载。Cloudflare 上的 DNS 记录和 Token 请自行处理（建议在 CF 轮换/删除 Token）。"
   exit 0
 }
@@ -1156,7 +1170,8 @@ main_menu() {
     msg "  9) 卸载"
     msg "  0) 退出"
     msg ""
-    msg "快捷命令: rsite link | rsite doctor | rsite install"
+    msg "${C_G}下次直接输入 rl 即可调出本菜单${C_0}（等同 rsite）"
+    msg "快捷命令: rl link | rl doctor | rl install"
     local c; ask c "请选择 [0-9]" ""
     case "$c" in
       1) wizard ;;
