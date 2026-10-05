@@ -39,7 +39,7 @@ rsite doctor     # 诊断
 
 | 步骤 | 内容 |
 |---|---|
-| 1 | 域名（如 `123456.example.com`） |
+| 1 | 域名（如 `thoracic.example.com`） |
 | 2 | CF Token（不回显，自动查找所属区域；已有有效证书时可跳过） |
 | 3 | VPS 公网 IPv4（自动探测）、Reality 端口（默认 443）、nginx 回落端口（默认 8443） |
 | 4 | UUID / shortId / fingerprint / 节点名（回车自动生成） |
@@ -72,6 +72,15 @@ rsite doctor     # 诊断
 
 「只有自己能用代理」靠的是 UUID + shortId + 私钥，这三样不要外传。
 
+## 附带：麻将连连看
+
+[`lianliankan.html`](lianliankan.html) 是一个单文件、无依赖的麻将连连看小游戏（万 / 筒 / 条 / 风 / 箭，三档难度，提示、重排、最佳用时）。可以直接用浏览器打开，也可以放进伪装站目录作为一个页面：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhuoyi0918/Reality-Site-OneClick/main/lianliankan.html \
+  -o /var/www/thoracic/lianliankan.html
+```
+
 ## 网站内容建议
 
-纯静态 HTML/CSS，不放大文件或视频。
+纯静态 HTML/CSS，不放大文件或视频；不放预约或问诊表单，不收集个人信息；只做科普，不写疗效承诺。
