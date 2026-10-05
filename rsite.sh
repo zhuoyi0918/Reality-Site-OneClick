@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.0.0"
+RSITE_VERSION="1.0.1"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -352,6 +352,12 @@ cert_ok() { # 证书存在、CN/SAN 匹配、7 天内不过期
   openssl x509 -in "$c" -noout -checkend 604800 >/dev/null 2>&1 || return 1
   openssl x509 -in "$c" -noout -ext subjectAltName 2>/dev/null | grep -q "DNS:${DOMAIN}\b" \
     || openssl x509 -in "$c" -noout -subject 2>/dev/null | grep -q "CN *= *${DOMAIN}$"
+}
+
+# acme.sh 首次签发时保存在 account.conf 里的 CF Token（没有则输出空）
+acme_saved_token() {
+  [ -f /root/.acme.sh/account.conf ] || return 0
+  grep -m1 '^SAVED_CF_Token=' /root/.acme.sh/account.conf | cut -d= -f2- | tr -d "'\""
 }
 
 acme_install() {
@@ -690,15 +696,32 @@ wizard() {
   msg "CF「我的个人资料 → API 令牌」→ 模板「编辑区域 DNS」，区域资源只授权本域名所在区域。"
   msg "Token 只用于本次签发证书和写 DNS，输入时不显示；acme.sh 会自行保存以便自动续签。"
   CF_TOKEN=""
-  local need_token=1
+  local need_token=1 saved_token="" use_saved=0
   if [ "$reconf" = 1 ] && [ "$DOMAIN" = "$old_domain" ] && cert_ok; then
     need_token=0
     msg "${C_G}当前证书有效，可直接回车跳过（跳过则不改 DNS、不重签证书）。${C_0}"
+  else
+    # 同一区域（主域名）下换子域名：复用 acme.sh 已保存的 Token
+    saved_token="$(acme_saved_token)"
+    if [ -n "$saved_token" ]; then
+      info "检测到 acme.sh 已保存的 Token，验证是否可用于 ${DOMAIN}..."
+      CF_TOKEN="$saved_token"
+      if cf_find_zone "$DOMAIN" 2>/dev/null; then
+        use_saved=1
+        msg "${C_G}已保存的 Token 可用（区域: ${ZONE}），直接回车即可复用；也可以输入新的 Token。${C_0}"
+      else
+        msg "已保存的 Token 看不到 ${DOMAIN} 所在的区域，请输入可用的 Token。"
+      fi
+      CF_TOKEN=""
+    fi
   fi
   while :; do
     ask_secret CF_TOKEN "CF Token"
     if [ -z "$CF_TOKEN" ]; then
       [ "$need_token" = 0 ] && break
+      if [ "$use_saved" = 1 ]; then
+        CF_TOKEN="$saved_token"; ok "复用已保存的 Token，区域: ${ZONE}"; break
+      fi
       warn "首次部署必须提供 Token"; continue
     fi
     info "验证 Token 并查找区域..."
