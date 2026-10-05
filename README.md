@@ -21,7 +21,8 @@ sudo bash rsite.sh
 首次运行后会安装管理命令 `rsite`：
 
 ```bash
-rsite            # 交互菜单
+rsite            # 交互菜单（也可输入短命令 rl）
+rl               # 等同 rsite
 rsite install    # 直接进入部署向导
 rsite link       # 节点链接 / 二维码 / 客户端配置
 rsite doctor     # 诊断
