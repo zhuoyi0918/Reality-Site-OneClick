@@ -68,7 +68,7 @@ rsite doctor     # 诊断
    - UFW 防火墙、fail2ban、仅开启 BBR
 9. 其他协议：mieru / VLESS Encryption（与 Reality 各自独立，互不影响）
    - VLESS Encryption：Xray `mlkem768x25519plus`（抗量子混合加密，无 TLS、无流控），认证可选 x25519 / mlkem768，输出 `vless://` 链接
-   - mieru：官方 mita 服务端，自定义用户名 / 密码 / MTU，输出 `mierus://` 链接与 mieru 客户端 JSON
+   - mieru：官方 mita 服务端，自定义用户名 / 密码 / MTU，可选流量伪装（trafficPattern，降低流量特征：关闭 / 保守 / 激进，需 mita ≥3.28.0），输出 `mierus://` 链接与 mieru 客户端 JSON
 10. 卸载
 
 > 其他协议可与 Reality 共存于同一台机器，各用各的端口与 systemd 服务（`xray-venc`、`rsite-mita`）。VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+，sing-box 暂不支持）。
