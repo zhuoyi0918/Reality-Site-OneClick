@@ -18,7 +18,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.2.0"
+RSITE_VERSION="1.3.0"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -1539,8 +1539,8 @@ venc_remove() {
 }
 
 # ---------------------------------------------------------------- mieru
-MIERU_SKEYS="MIERU_PORT MIERU_USER MIERU_PASS MIERU_MTU MIERU_ADDR"
-mieru_defaults() { MIERU_PORT="2444"; MIERU_USER=""; MIERU_PASS=""; MIERU_MTU="1400"; MIERU_ADDR=""; }
+MIERU_SKEYS="MIERU_PORT MIERU_USER MIERU_PASS MIERU_MTU MIERU_ADDR MIERU_TP MIERU_TP_B64"
+mieru_defaults() { MIERU_PORT="2444"; MIERU_USER=""; MIERU_PASS=""; MIERU_MTU="1400"; MIERU_ADDR=""; MIERU_TP="conservative"; MIERU_TP_B64=""; }
 mieru_load() {
   mieru_defaults; [ -f "$MIERU_STATE" ] || return 1
   local k v
@@ -1583,12 +1583,39 @@ mieru_install_bin() {
   [ -x "$MITA_BIN" ] && ok "mita: $("$MITA_BIN" version 2>/dev/null | head -n1)"
 }
 
+# 流量伪装（trafficPattern）需要 mita >= 3.28.0
+mieru_tp_supported() {
+  local v; v="$("$MITA_BIN" version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
+  [ -n "$v" ] || return 1
+  [ "$(printf '%s\n%s\n' 3.28.0 "$v" | sort -V | head -n1)" = 3.28.0 ]
+}
+
+# 两档 trafficPattern JSON（与 NoBrand 一致）；off 返回非 0
+mieru_tp_object() {
+  case "$1" in
+    conservative) printf '%s' '{"seed":0,"unlockAll":false,"nonce":{"type":"NONCE_TYPE_PRINTABLE","applyToAllUDPPacket":true,"minLen":4,"maxLen":8},"padding":{"maxMiddlePaddingLen":0,"maxEndPaddingLen":128}}' ;;
+    aggressive)   printf '%s' '{"seed":0,"unlockAll":false,"tcpFragment":{"enable":true,"maxSleepMs":8},"nonce":{"type":"NONCE_TYPE_PRINTABLE","applyToAllUDPPacket":true,"minLen":6,"maxLen":12},"padding":{"maxMiddlePaddingLen":64,"maxEndPaddingLen":255}}' ;;
+    *) return 1 ;;
+  esac
+}
+
 mieru_gen_config() {
   mkdir -p "$MIERU_DIR" && chmod 700 "$MIERU_DIR"
-  jq -n --argjson port "$MIERU_PORT" --arg user "$MIERU_USER" --arg pass "$MIERU_PASS" --argjson mtu "$MIERU_MTU" '
+  local tp_arg='null'
+  if [ "${MIERU_TP:-off}" != off ]; then
+    if mieru_tp_supported; then
+      tp_arg="$(mieru_tp_object "$MIERU_TP")" || tp_arg='null'
+    else
+      warn "当前 mita 版本不支持流量伪装（需 ≥3.28.0），本次跳过；升级 mita 后重新部署可启用"
+      tp_arg='null'; MIERU_TP=off
+    fi
+  fi
+  jq -n --argjson port "$MIERU_PORT" --arg user "$MIERU_USER" --arg pass "$MIERU_PASS" \
+     --argjson mtu "$MIERU_MTU" --argjson tp "$tp_arg" '
   {portBindings:[{port:$port,protocol:"TCP"}],
    users:[{name:$user,password:$pass}],
-   loggingLevel:"INFO", mtu:$mtu}' >"${MIERU_CONF}.tmp" || return 1
+   loggingLevel:"INFO", mtu:$mtu}
+   + (if $tp==null then {} else {trafficPattern:$tp} end)' >"${MIERU_CONF}.tmp" || return 1
   mv -f "${MIERU_CONF}.tmp" "$MIERU_CONF"; chmod 600 "$MIERU_CONF"
 }
 
@@ -1618,17 +1645,21 @@ EOF
 }
 
 mieru_link() {
-  printf 'mierus://%s:%s@%s?handshake-mode=HANDSHAKE_NO_WAIT&mtu=%s&multiplexing=MULTIPLEXING_OFF&port=%s&profile=default&protocol=TCP' \
-    "$(urlenc "$MIERU_USER")" "$(urlenc "$MIERU_PASS")" "$(link_host "$MIERU_ADDR")" "$MIERU_MTU" "$MIERU_PORT"
+  local tp=""
+  [ -n "${MIERU_TP_B64:-}" ] && tp="&traffic-pattern=$(urlenc "$MIERU_TP_B64")"
+  printf 'mierus://%s:%s@%s?handshake-mode=HANDSHAKE_NO_WAIT&mtu=%s&multiplexing=MULTIPLEXING_OFF&port=%s&profile=default&protocol=TCP%s' \
+    "$(urlenc "$MIERU_USER")" "$(urlenc "$MIERU_PASS")" "$(link_host "$MIERU_ADDR")" "$MIERU_MTU" "$MIERU_PORT" "$tp"
 }
 
 mieru_client_json() {
+  local tp='null'
+  [ "${MIERU_TP:-off}" != off ] && tp="$(mieru_tp_object "$MIERU_TP" 2>/dev/null || echo null)"
   jq -n --arg u "$MIERU_USER" --arg p "$MIERU_PASS" --arg h "$MIERU_ADDR" \
-     --argjson port "$MIERU_PORT" --argjson mtu "$MIERU_MTU" '
-  {profiles:[{profileName:"default",
+     --argjson port "$MIERU_PORT" --argjson mtu "$MIERU_MTU" --argjson tp "$tp" '
+  {profiles:[({profileName:"default",
      user:{name:$u,password:$p},
      servers:[{ipAddress:$h,portBindings:[{port:$port,protocol:"TCP"}]}],
-     mtu:$mtu}],
+     mtu:$mtu} + (if $tp==null then {} else {trafficPattern:$tp} end))],
    activeProfile:"default", rpcPort:8964, socks5Port:1080, loggingLevel:"INFO"}'
 }
 
@@ -1636,7 +1667,8 @@ mieru_show() {
   mieru_load || { warn "尚未部署 mieru"; return 1; }
   local link; link="$(mieru_link)"
   title "mieru 节点"
-  kv "连接地址" "$MIERU_ADDR" "端口" "$MIERU_PORT" "协议" "TCP" "用户名" "$MIERU_USER" "MTU" "$MIERU_MTU"
+  local tplabel; case "${MIERU_TP:-off}" in off) tplabel="关闭";; aggressive) tplabel="激进";; *) tplabel="保守";; esac
+  kv "连接地址" "$MIERU_ADDR" "端口" "$MIERU_PORT" "协议" "TCP" "用户名" "$MIERU_USER" "MTU" "$MIERU_MTU" "流量伪装" "$tplabel"
   line
   msg "${C_W}mierus:// 分享链接：${C_0}"; msg "${C_G}${link}${C_0}"
   line
@@ -1662,7 +1694,11 @@ mieru_deploy() {
   local defpass="${MIERU_PASS:-$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)}"
   ask MIERU_PASS "密码（回车用随机）" "$defpass"; [ -n "$MIERU_PASS" ] || MIERU_PASS="$defpass"
   while :; do ask MIERU_MTU "MTU" "$MIERU_MTU"; [[ "$MIERU_MTU" =~ ^[0-9]+$ ]] && [ "$MIERU_MTU" -ge 1280 ] && [ "$MIERU_MTU" -le 1500 ] && break; warn "MTU 取值 1280-1500"; done
-  confirm "开始部署 mieru（端口 ${MIERU_PORT}/TCP）？" y || return 0
+  local tp_in
+  msg "流量伪装（降低流量特征，需 mita ≥3.28.0）: 0) 关闭  1) 保守(推荐，开销低)  2) 激进(更隐蔽但略慢)"
+  ask tp_in "选择" "$(case "${MIERU_TP:-conservative}" in off) echo 0;; aggressive) echo 2;; *) echo 1;; esac)"
+  case "$tp_in" in 0) MIERU_TP=off;; 2) MIERU_TP=aggressive;; *) MIERU_TP=conservative;; esac
+  confirm "开始部署 mieru（端口 ${MIERU_PORT}/TCP，流量伪装: ${MIERU_TP}）？" y || return 0
 
   mieru_install_bin || return 1
   mieru_gen_config || { err "生成配置失败"; return 1; }
@@ -1680,6 +1716,13 @@ mieru_deploy() {
   done
   if ! printf '%s' "$st" | grep -q 'RUNNING'; then
     err "mita 未进入 RUNNING，查看: journalctl -u $MIERU_SVC -n 40"; return 1
+  fi
+  # 导出流量伪装编码，供客户端链接使用
+  MIERU_TP_B64=""
+  if [ "${MIERU_TP:-off}" != off ]; then
+    MIERU_TP_B64="$(MITA_CONFIG_JSON_FILE="$MIERU_CONF" MITA_UDS_PATH="$MIERU_UDS" MITA_INSECURE_UDS=1 \
+      "$MITA_BIN" export traffic-pattern 2>/dev/null | tr -d '[:space:]')"
+    mieru_save
   fi
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
     ufw allow "${MIERU_PORT}/tcp" >/dev/null && ok "UFW 已放行 ${MIERU_PORT}/tcp"
