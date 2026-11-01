@@ -1,6 +1,6 @@
 # Reality-Site-OneClick
 
-nginx 伪装站 + VLESS Reality（**自有域名做 target**）一键部署脚本。终端交互菜单，不依赖 S-UI 等面板。可选在同机加挂 **mieru** 与 **VLESS Encryption** 节点。
+nginx 伪装站 + VLESS Reality（**自有域名做 target**）一键部署脚本。终端交互菜单，不依赖 S-UI 等面板。可选在同机加挂 **mieru**、**VLESS Encryption**、**MASQUE**（WARP 双向证书 / RFC 账号密码）节点，并提供 **Xray 升级、sing-box 安装与升级**。
 
 输入 Cloudflare Token、域名、IP、端口 → 自动完成 DNS（灰云）→ acme.sh DNS-01 证书 → nginx 回落站 → Xray Reality → 输出 `vless://` 链接、二维码、Mihomo / sing-box 配置。
 
@@ -26,6 +26,8 @@ rl               # 等同 rsite
 rsite install    # 直接进入部署向导
 rsite link       # 节点链接 / 二维码 / 客户端配置
 rsite doctor     # 诊断
+rsite masque     # MASQUE 客户端配置（mihomo / usque / Surge / Xray）
+rsite core       # 核心管理：Xray 升级 / sing-box 安装与升级
 ```
 
 支持 Debian 11+ / Ubuntu 20.04+，需 root 与 systemd。
@@ -69,9 +71,35 @@ rsite doctor     # 诊断
 9. 其他协议：mieru / VLESS Encryption（与 Reality 各自独立，互不影响）
    - VLESS Encryption：Xray `mlkem768x25519plus`（抗量子混合加密，无 TLS、无流控），认证可选 x25519 / mlkem768，输出 `vless://` 链接
    - mieru：官方 mita 服务端，自定义用户名 / 密码 / MTU，可选流量伪装（trafficPattern，降低流量特征：关闭 / 保守 / 激进，需 mita ≥3.28.0），输出 `mierus://` 链接与 mieru 客户端 JSON
-10. 卸载
+   - MASQUE：HTTP/3 CONNECT-IP（RFC 9484），两种认证可单独或同时部署（见下文）
+10. 核心管理：Xray 升级（正式版 / 预发布版 / 指定版本，失败自动回滚）、sing-box 安装与升级（正式版 / 预发布版 / 指定版本）、卸载 sing-box、升级 masque-server
+11. 卸载
 
-> 其他协议可与 Reality 共存于同一台机器，各用各的端口与 systemd 服务（`xray-venc`、`rsite-mita`）。VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+，sing-box 暂不支持）。
+> 其他协议可与 Reality 共存于同一台机器，各用各的端口与 systemd 服务（`xray-venc`、`rsite-mita`、`masque`、`rsite-masque-nat`）。VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+，sing-box 暂不支持）。
+
+## MASQUE
+
+服务端使用 [masque-server](https://github.com/Vincent-bin/masque-server)（Rust，官方发行包 + SHA-256 校验），一个进程内可同时开两种认证的监听：
+
+| 模式 | 认证 | 适用客户端 |
+|---|---|---|
+| WARP 双向证书 | TLS 双向认证（mTLS）：客户端 ECDSA P-256 私钥做客户端证书，服务端按公钥白名单放行；客户端固定服务端 ECDSA 公钥。与 Cloudflare WARP 的 MASQUE 规范一致（`cf-connect-ip`） | mihomo（`type: masque`）、usque 等 |
+| RFC 账号密码 | HTTP Basic（`Proxy-Authorization`），RFC 9484 CONNECT-IP / RFC 9298 CONNECT-UDP，可选 stealth（未认证一律 404） | Surge、Xray `masque` 出站等 |
+
+**部署前检查**（每次部署自动执行）：
+
+- `/dev/net/tun` 是否可用（OpenVZ/LXC 需在面板开 TUN）。
+- TCP / UDP 443 当前占用者，是否已有 Reality（本脚本或其他 xray / sing-box / 面板配置）。MASQUE 走 HTTP/3 = **UDP**，Reality 是 **TCP**，两者可共用 443 端口号；只有「HTTP/2 回落」需要 TCP，必须换端口。
+- 运行中的 Hysteria2 / TUIC / sing-box / 面板 / WARP 等服务、全部对外监听端口。
+- 逐个检查所选端口：与 Reality、nginx 回落、VLESS-Enc、mieru、另一种 MASQUE 模式、以及任意其他进程冲突时，给出选项：改用推荐空闲端口 / 停止并禁用占用的 systemd 服务（Reality 受保护不提供）/ 忽略 / 取消。
+- 隧道地址池自动避开本机已有网段。
+
+**其他：**
+
+- 证书可复用 Reality 站点的 ECC 证书（acme.sh 续签后通过 `rsite cert-hook` 自动同步并重载；acme.sh 续签默认复用私钥，WARP 客户端固定的公钥不变），或使用 10 年自签 ECDSA 证书（RFC 客户端用 SHA-256 指纹固定）。
+- CONNECT-IP 需要 IP 转发与 NAT：由 `rsite-masque-nat.service` 开机加载（带注释的 iptables 规则，可整体撤销；默认禁止隧道访问内网；MSS 钳制；开启 IPv6 转发前把出口网卡设为 `accept_ra=2`，避免丢失 IPv6 默认路由）。
+- WARP 客户端可随时新增 / 吊销（每台设备一对密钥、固定隧道地址）；RFC 模式可改密码。
+- 云服务商安全组记得放行对应 **UDP** 端口。
 
 ## 细节
 
@@ -81,7 +109,8 @@ rsite doctor     # 诊断
 - 兼容 Xray 新旧版本（`target` / `dest`、`x25519` 输出格式）。
 - 签发前清理 acme.sh 中写死的 `SAVED_CF_Zone_ID / SAVED_CF_Account_ID`，避免 `count:0` 类错误。
 - 443 被 S-UI 占用时可一键停用 s-ui。
-- 状态保存在 `/etc/rsite/rsite.env`（600），链接保存在 `/etc/rsite/link.txt`。
+- 状态保存在 `/etc/rsite/rsite.env`（600），链接保存在 `/etc/rsite/link.txt`；MASQUE 状态 `/etc/rsite/masque.env`，客户端配置 `/etc/rsite/masque-clients.txt`。
+- sing-box 用官方安装脚本（deb 包）。官方包自带的示例配置含公开密码的 SS 入站，本脚本安装后会替换为空配置，且不会自动启用服务。
 
 「只有自己能用代理」靠的是 UUID + shortId + 私钥，这三样不要外传。
 

@@ -12,13 +12,15 @@
 #    rsite install            # 直接进入部署向导
 #    rsite link               # 显示节点链接 / 二维码 / Mihomo 配置
 #    rsite doctor             # 诊断
+#    rsite masque             # 显示 MASQUE 客户端配置
+#    rsite core               # 核心管理：Xray 升级 / sing-box 安装与升级
 #
 #  支持: Debian 11+ / Ubuntu 20.04+ (x86_64 / arm64)，需 root
 # =============================================================================
 
 set -o pipefail
 
-RSITE_VERSION="1.3.0"
+RSITE_VERSION="1.4.0"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -208,6 +210,27 @@ detect_ip() {
 port_owner() { # 输出占用端口的进程名（TCP 监听）
   ss -Hltnp "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1 | cut -d'"' -f2
 }
+port_owner_udp() { # 输出占用 UDP 端口的进程名
+  ss -Hlunp "sport = :$1" 2>/dev/null | grep -o 'users:(("[^"]*"' | head -n1 | cut -d'"' -f2
+}
+port_pid() { # port_pid tcp|udp 端口 → 第一个占用进程的 PID
+  local f=-Hltnp; [ "$1" = udp ] && f=-Hlunp
+  ss "$f" "sport = :$2" 2>/dev/null | grep -oE 'pid=[0-9]+' | head -n1 | cut -d= -f2
+}
+pid_unit() { # 进程所属的 systemd 服务名（没有则输出空）
+  [ -n "$1" ] || return 0
+  grep -oE '[^/]+\.service' "/proc/$1/cgroup" 2>/dev/null | tail -n1
+}
+# GitHub 最新版本号（去掉 v 前缀）；第二个参数 beta 表示包含预发布
+gh_latest_tag() {
+  local repo="$1" t=""
+  if [ "${2:-}" = beta ]; then
+    t="$(curl -fsSL --max-time 8 "https://api.github.com/repos/${repo}/releases?per_page=1" 2>/dev/null | jq -r '.[0].tag_name // empty' 2>/dev/null)"
+  else
+    t="$(curl -fsSL --max-time 8 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null)"
+  fi
+  printf '%s' "${t#v}"
+}
 
 nginx_ver_ge() { # nginx_ver_ge 1.25.1
   local v; v="$(nginx -v 2>&1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1)"
@@ -379,6 +402,15 @@ acme_install() {
   [ -x "$ACME" ]
 }
 
+# 安装证书到 nginx 目录；续签后执行 rsite cert-hook（重载 nginx，并同步给 MASQUE）
+acme_install_cert() {
+  mkdir -p "$(cert_dir)"
+  "$ACME" --install-cert -d "$DOMAIN" --ecc \
+    --key-file "$(cert_dir)/key.pem" --fullchain-file "$(cert_dir)/cert.pem" \
+    --reloadcmd "${RSITE_BIN} cert-hook >/dev/null 2>&1 || systemctl reload nginx 2>/dev/null || true" >/dev/null || return 1
+  chmod 600 "$(cert_dir)/key.pem"
+}
+
 issue_cert() {
   acme_install || return 1
   # 附录 A：清掉 account.conf 里写死的旧 Zone/Account ID，避免 count:0 类错误
@@ -394,11 +426,7 @@ issue_cert() {
     msg "  常见原因：Token 没有该区域的 DNS 编辑权限 / Token 设置了 IP 筛选但未包含本机 IP"
     return 1
   fi
-  mkdir -p "$(cert_dir)"
-  "$ACME" --install-cert -d "$DOMAIN" --ecc \
-    --key-file "$(cert_dir)/key.pem" --fullchain-file "$(cert_dir)/cert.pem" \
-    --reloadcmd "systemctl reload nginx 2>/dev/null || true" >/dev/null || { err "安装证书失败"; return 1; }
-  chmod 600 "$(cert_dir)/key.pem"
+  acme_install_cert || { err "安装证书失败"; return 1; }
   cert_ok || { err "证书文件校验失败"; return 1; }
   ok "证书: $(openssl x509 -in "$(cert_dir)/cert.pem" -noout -subject -enddate | tr '\n' ' ')"
 }
@@ -1011,7 +1039,147 @@ service_menu() {
     4) systemctl start xray && ok "已启动" ;;
     5) journalctl -u xray -n 50 --no-pager ;;
     6) tail -n 30 /var/log/nginx/error.log ;;
-    7) install_xray upgrade && state_load && apply_xray ;;
+    7) xray_upgrade stable ;;
+  esac
+}
+
+# -----------------------------------------------------------------------------
+# 核心管理：Xray 升级 / sing-box 安装与升级
+# -----------------------------------------------------------------------------
+SB_BIN="/usr/bin/sing-box"
+SB_CONF="/etc/sing-box/config.json"
+SB_INSTALL_URL="https://sing-box.app/install.sh"
+SB_INSTALL_URL2="https://raw.githubusercontent.com/SagerNet/sing-box/testing/docs/installation/tools/install.sh"
+
+xray_ver_now() { [ -x "$XRAY_BIN" ] && "$XRAY_BIN" version 2>/dev/null | head -n1 | awk '{print $2}'; }
+
+# xray_upgrade stable|beta|ver [版本号]
+# 升级后用新核心测试所有 rsite 生成的 Xray 配置，失败自动回滚到旧核心
+xray_upgrade() {
+  local mode="$1" ver="${2:-}" old bak args=(install) out c bad=0
+  apt_install curl jq unzip >/dev/null || return 1
+  old="$(xray_ver_now)"
+  case "$mode" in
+    beta) args+=(--beta) ;;
+    ver)  [[ "$ver" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+$ ]] || { err "版本号格式应为 25.10.15 这样的数字"; return 1; }
+          args+=(--version "v${ver#v}") ;;
+  esac
+  mkdir -p "$RSITE_BACKUP"; bak="$RSITE_BACKUP/xray.bin.prev"
+  [ -x "$XRAY_BIN" ] && cp -f "$XRAY_BIN" "$bak"
+  info "升级 Xray（当前: ${old:-未安装}，方式: ${mode}${ver:+ $ver}）"
+  if ! out="$(bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ "${args[@]}" 2>&1)"; then
+    err "Xray 安装脚本失败："; msg "$out" | tail -n 8; return 1
+  fi
+  [ -x "$XRAY_BIN" ] || { err "未找到 $XRAY_BIN"; return 1; }
+  for c in "$XRAY_CONF" "$VENC_CONF"; do
+    [ -s "$c" ] || continue
+    if ! "$XRAY_BIN" run -test -c "$c" >/dev/null 2>&1; then
+      warn "新核心无法通过配置测试: $c"; bad=1
+    fi
+  done
+  if [ "$bad" = 1 ] && [ -s "$bak" ]; then
+    if confirm "是否回滚到旧版本 ${old}？" y; then
+      install -m 755 "$bak" "$XRAY_BIN"
+      systemctl restart xray 2>/dev/null; systemctl try-restart "$VENC_SVC" 2>/dev/null
+      warn "已回滚到 $(xray_ver_now)"; return 1
+    fi
+  fi
+  # Reality：重新生成配置（新核心可能支持 limitFallback 等新字段）
+  if state_load && is_deployed; then apply_xray || return 1
+  else systemctl try-restart xray 2>/dev/null || true; fi
+  systemctl try-restart "$VENC_SVC" 2>/dev/null || true
+  ok "Xray: ${old:-无} → $(xray_ver_now)"
+}
+
+sb_ver_now() { [ -x "$SB_BIN" ] && "$SB_BIN" version 2>/dev/null | head -n1 | awk '{print $3}'; }
+
+# 官方安装包自带的示例配置是一个公开密码的 shadowsocks 入站，启用服务前必须替换
+sb_sanitize_conf() {
+  [ -f "$SB_CONF" ] || return 0
+  if grep -q 'Gn1JUS14bLUHgv1cWDDp4A==' "$SB_CONF" 2>/dev/null; then
+    mkdir -p "$RSITE_BACKUP"; cp -f "$SB_CONF" "$RSITE_BACKUP/sing-box-sample.json"
+    printf '%s\n' '{' '  "log": { "level": "warn" },' '  "inbounds": [],' \
+      '  "outbounds": [ { "type": "direct", "tag": "direct" } ]' '}' >"$SB_CONF"
+    chmod 600 "$SB_CONF"
+    info "已把官方示例配置（含公开密码的 SS 入站）替换为空配置: $SB_CONF"
+  fi
+}
+
+# singbox_install stable|beta|ver [版本号]
+singbox_install() {
+  local mode="$1" ver="${2:-}" old tmp args=()
+  command -v dpkg >/dev/null 2>&1 || { err "仅支持 dpkg 系统"; return 1; }
+  apt_install curl jq >/dev/null || return 1
+  old="$(sb_ver_now)"
+  case "$mode" in
+    beta) args+=(--beta) ;;
+    ver)  [[ "$ver" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$ ]] || { err "版本号格式应为 1.12.0 或 1.13.0-beta.1"; return 1; }
+          args+=(--version "${ver#v}") ;;
+  esac
+  tmp="$(mktemp -d)"
+  if ! curl -fsSL --max-time 30 "$SB_INSTALL_URL" -o "$tmp/install.sh" 2>/dev/null; then
+    curl -fsSL --max-time 30 "$SB_INSTALL_URL2" -o "$tmp/install.sh" || { err "下载 sing-box 安装脚本失败"; rm -rf "$tmp"; return 1; }
+  fi
+  info "安装 sing-box（当前: ${old:-未安装}，方式: ${mode}${ver:+ $ver}）"
+  if ! ( cd "$tmp" && sh ./install.sh "${args[@]}" ); then
+    err "sing-box 安装失败"; rm -rf "$tmp"; return 1
+  fi
+  rm -rf "$tmp"
+  [ -x "$SB_BIN" ] || { err "未找到 $SB_BIN"; return 1; }
+  sb_sanitize_conf
+  if systemctl is-active --quiet sing-box 2>/dev/null; then
+    if "$SB_BIN" check -c "$SB_CONF" >/dev/null 2>&1; then
+      systemctl restart sing-box && ok "sing-box 服务已重启"
+    else
+      warn "新版本 sing-box 无法通过现有配置检查（sing-box check -c $SB_CONF），服务未重启，请按新版文档调整配置"
+    fi
+  fi
+  ok "sing-box: ${old:-无} → $(sb_ver_now)"
+  [ -z "$old" ] && msg "提示：仅安装了核心，服务未启用。配置写入 $SB_CONF 后执行 systemctl enable --now sing-box。"
+}
+
+singbox_remove() {
+  [ -x "$SB_BIN" ] || { warn "未安装 sing-box"; return 0; }
+  confirm "卸载 sing-box（会停止服务，配置目录 /etc/sing-box 保留）？" n || return 0
+  systemctl disable --now sing-box >/dev/null 2>&1
+  local p; p="$(dpkg-query -W -f='${Package}\n' 'sing-box*' 2>/dev/null | head -n1)"
+  if [ -n "$p" ]; then DEBIAN_FRONTEND=noninteractive apt-get remove -y "$p" >/dev/null 2>&1; fi
+  [ -x "$SB_BIN" ] && rm -f "$SB_BIN"
+  ok "已卸载 sing-box"
+}
+
+core_menu() {
+  local c v
+  title "核心管理：Xray / sing-box / masque-server"
+  info "查询最新版本..."
+  kv "Xray 当前" "$(xray_ver_now || true)" \
+     "Xray 最新正式" "$(gh_latest_tag XTLS/Xray-core)" \
+     "Xray 最新预发布" "$(gh_latest_tag XTLS/Xray-core beta)" \
+     "sing-box 当前" "$(sb_ver_now || true)" \
+     "sing-box 最新正式" "$(gh_latest_tag SagerNet/sing-box)" \
+     "sing-box 最新预发布" "$(gh_latest_tag SagerNet/sing-box beta)" \
+     "masque-server 当前" "$(mq_ver_now || true)" \
+     "masque-server 最新" "$(gh_latest_tag "$MQ_REPO")"
+  msg ""
+  msg "  1) 升级 Xray 到最新正式版"
+  msg "  2) 升级 Xray 到最新预发布版（beta）"
+  msg "  3) 安装指定版本 Xray（可用于回退）"
+  msg "  4) 安装 / 升级 sing-box 到最新正式版"
+  msg "  5) 安装 / 升级 sing-box 到最新预发布版（beta）"
+  msg "  6) 安装指定版本 sing-box"
+  msg "  7) 卸载 sing-box"
+  msg "  8) 升级 masque-server（MASQUE 服务端）"
+  msg "  0) 返回"
+  ask c "请选择 [0-8]" ""
+  case "$c" in
+    1) xray_upgrade stable ;;
+    2) xray_upgrade beta ;;
+    3) ask v "Xray 版本号（如 25.10.15）" ""; xray_upgrade ver "$v" ;;
+    4) singbox_install stable ;;
+    5) singbox_install beta ;;
+    6) ask v "sing-box 版本号（如 1.12.0）" ""; singbox_install ver "$v" ;;
+    7) singbox_remove ;;
+    8) mq_install_bin upgrade ;;
   esac
 }
 
@@ -1345,13 +1513,14 @@ harden_menu() {
 uninstall() {
   state_load || true
   title "卸载"
-  warn "将删除：Xray（含配置）、nginx 站点配置 rsite.conf、证书续签任务、rsite 状态与命令。"
-  msg "保留：nginx 软件包、UFW 规则、SSH 设置、网站目录（会单独询问）。"
+  warn "将删除：Xray（含配置）、nginx 站点配置 rsite.conf、证书续签任务、VLESS-Enc / mieru / MASQUE、rsite 状态与命令。"
+  msg "保留：nginx 软件包、sing-box、UFW 规则、SSH 设置、网站目录（会单独询问）。"
   confirm "确定卸载？" n || return 0
   systemctl disable --now xray >/dev/null 2>&1
   # 一并清理其他协议（若存在）
   systemctl disable --now "$VENC_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${VENC_SVC}.service"; rm -rf "$VENC_DIR" "$VENC_STATE" "${RSITE_DIR}/venc-link.txt"
   systemctl disable --now "$MIERU_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${MIERU_SVC}.service"; rm -rf "$MIERU_DIR" "$MIERU_STATE" "${RSITE_DIR}/mieru-link.txt"
+  [ -f "$MQ_STATE" ] && mq_purge quiet
   systemctl daemon-reload 2>/dev/null || true
   bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ remove --purge >/dev/null 2>&1 || rm -f "$XRAY_BIN"
   rm -f "$NGINX_CONF"
@@ -1741,14 +1910,846 @@ mieru_remove() {
   ok "已删除 mieru"
 }
 
+# =============================================================================
+#  MASQUE（HTTP/3 CONNECT-IP，RFC 9484）
+#  服务端: Vincent-bin/masque-server（Rust），同一进程可同时开两种认证的监听：
+#    · WARP 模式: TLS 双向认证（mTLS），客户端 ECDSA P-256 公私钥对、服务端公钥固定
+#                 —— 与 Cloudflare WARP 的 MASQUE 规范一致（mihomo masque / usque 等）
+#    · RFC  模式: HTTP Basic 账号密码（RFC 9484 / 9298 通用客户端：Surge、Xray masque 出站等）
+#  HTTP/3 走 UDP，与 Reality（TCP）可共用 443 端口号
+# =============================================================================
+MQ_REPO="Vincent-bin/masque-server"
+MQ_FALLBACK_VER="0.13.0"
+MQ_BIN="/usr/local/bin/masque-server"
+MQ_PROBE_BIN="/usr/local/bin/masque-probe"
+MQ_ETC="/etc/masque"
+MQ_CONF="${MQ_ETC}/masque.toml"
+MQ_CERTS="${MQ_ETC}/certs"
+MQ_SVC="masque"
+MQ_NAT_SVC="rsite-masque-nat"
+MQ_STATE="${RSITE_DIR}/masque.env"
+MQ_CLI_DIR="${RSITE_DIR}/masque-clients"
+MQ_SELF_DIR="${RSITE_DIR}/masque-selfsigned"
+MQ_TUN="masque0"
+MQ_TAG="rsite-masque"
+
+MQ_KEYS="MQ_WARP MQ_WARP_PORT MQ_WARP_H2 MQ_RFC MQ_RFC_PORT MQ_RFC_H2 MQ_RFC_USER MQ_RFC_PASS MQ_RFC_HASH MQ_RFC_STEALTH MQ_ADDR MQ_HOST MQ_CERT_SRC MQ_POOL4 MQ_POOL6 MQ_V6 MQ_MTU MQ_SRV_PUB MQ_BLOCK_PRIV MQ_OFFLOAD"
+mq_defaults() {
+  MQ_WARP=no; MQ_WARP_PORT=""; MQ_WARP_H2=""
+  MQ_RFC=no; MQ_RFC_PORT=""; MQ_RFC_H2=""; MQ_RFC_USER="masque"; MQ_RFC_PASS=""; MQ_RFC_HASH=""; MQ_RFC_STEALTH=no
+  MQ_ADDR=""; MQ_HOST=""; MQ_CERT_SRC=""; MQ_POOL4=""; MQ_POOL6=""; MQ_V6=no; MQ_MTU=1280
+  MQ_SRV_PUB=""; MQ_BLOCK_PRIV=yes; MQ_OFFLOAD=yes
+}
+mq_load() {
+  mq_defaults; [ -f "$MQ_STATE" ] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case " $MQ_KEYS " in *" $k "*) ;; *) continue ;; esac
+    v="${v#\'}"; v="${v%\'}"; printf -v "$k" '%s' "$v"
+  done <"$MQ_STATE"; return 0
+}
+mq_save() {
+  mkdir -p "$RSITE_DIR" && chmod 700 "$RSITE_DIR"
+  local k tmp="${MQ_STATE}.tmp"; : >"$tmp" && chmod 600 "$tmp"
+  for k in $MQ_KEYS; do printf "%s='%s'\n" "$k" "${!k}" >>"$tmp"; done
+  mv -f "$tmp" "$MQ_STATE"
+}
+mq_any() { [ "$MQ_WARP" = yes ] || [ "$MQ_RFC" = yes ]; }
+mq_deployed() { [ -f "$MQ_STATE" ] && [ -x "$MQ_BIN" ] && [ -f "$MQ_CONF" ]; }
+mq_ver_now() { [ -x "$MQ_BIN" ] && "$MQ_BIN" --version 2>/dev/null | awk '{print $NF}'; }
+mq_arch() { case "$(uname -m)" in x86_64|amd64) printf x86_64 ;; aarch64|arm64) printf aarch64 ;; *) return 1 ;; esac; }
+
+# ---------------------------------------------------------------- 安装 / 升级
+mq_write_unit() { # 发行包里没有 unit 时的兜底（与上游一致的最小权限）
+  cat >/etc/systemd/system/${MQ_SVC}.service <<EOF
+[Unit]
+Description=MASQUE HTTP/2 and HTTP/3 proxy server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=30s
+User=masque
+Group=masque
+ExecStart=${MQ_BIN} --config ${MQ_CONF}
+ExecReload=/bin/kill -HUP \$MAINPID
+Restart=on-failure
+RestartSec=2s
+LimitNOFILE=1048576
+AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+StateDirectory=masque
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+# mq_install_bin [upgrade]  —— 下载官方发行包并校验 SHA-256；升级前用新版本检查现有配置，失败自动回滚
+mq_install_bin() {
+  if [ -x "$MQ_BIN" ] && [ "${1:-}" != upgrade ]; then ok "masque-server 已安装: $(mq_ver_now)"; return 0; fi
+  [ "${1:-}" = upgrade ] && [ ! -x "$MQ_BIN" ] && { warn "尚未安装 masque-server（在「其他协议」里部署 MASQUE 时会自动安装）"; return 0; }
+  local arch ver old name base tmp exp act dir
+  arch="$(mq_arch)" || { err "masque-server 只提供 x86_64 / arm64 版本"; return 1; }
+  apt_install curl jq tar openssl >/dev/null || return 1
+  ver="${MASQUE_VERSION:-$(gh_latest_tag "$MQ_REPO")}"; ver="${ver#v}"; [ -n "$ver" ] || ver="$MQ_FALLBACK_VER"
+  old="$(mq_ver_now)"
+  if [ "${1:-}" = upgrade ] && [ "$old" = "$ver" ]; then ok "masque-server 已是最新（${ver}）"; return 0; fi
+  name="masque-v${ver}-linux-${arch}.tar.gz"
+  base="https://github.com/${MQ_REPO}/releases/download/v${ver}"
+  tmp="$(mktemp -d)"
+  info "下载 masque-server v${ver}（${arch}）"
+  if ! curl -fsSL --max-time 180 "$base/$name" -o "$tmp/$name" || ! curl -fsSL --max-time 30 "$base/$name.sha256" -o "$tmp/sum"; then
+    err "下载失败: $base/$name"; rm -rf "$tmp"; return 1
+  fi
+  exp="$(grep -oE '[0-9a-fA-F]{64}' "$tmp/sum" | head -n1 | tr 'A-F' 'a-f')"
+  act="$(sha256sum "$tmp/$name" | awk '{print $1}')"
+  if [ -z "$exp" ] || [ "$exp" != "$act" ]; then err "SHA-256 校验失败，已中止"; rm -rf "$tmp"; return 1; fi
+  tar xzf "$tmp/$name" -C "$tmp" 2>/dev/null || { err "解压失败"; rm -rf "$tmp"; return 1; }
+  dir="$(find "$tmp" -type f -path '*/bin/masque-server' | head -n1)"; dir="${dir%/bin/masque-server}"
+  [ -n "$dir" ] && [ -f "$dir/bin/masque-server" ] || { err "发行包内未找到 masque-server"; rm -rf "$tmp"; return 1; }
+  chmod 755 "$dir/bin/masque-server"
+  if [ -s "$MQ_CONF" ] && ! "$dir/bin/masque-server" --config "$MQ_CONF" check-config >/dev/null 2>&1; then
+    err "新版本无法通过现有配置检查，已中止（未改动任何文件）："
+    "$dir/bin/masque-server" --config "$MQ_CONF" check-config 2>&1 | tail -n 5
+    rm -rf "$tmp"; return 1
+  fi
+  getent group masque >/dev/null 2>&1 || groupadd --system masque
+  id masque >/dev/null 2>&1 || useradd --system --gid masque --home-dir /var/lib/masque \
+    --no-create-home --shell /usr/sbin/nologin masque
+  mkdir -p "$RSITE_BACKUP"
+  [ -x "$MQ_BIN" ] && cp -f "$MQ_BIN" "$RSITE_BACKUP/masque-server.prev"
+  install -m 0755 "$dir/bin/masque-server" "$MQ_BIN"
+  [ -f "$dir/bin/masque-probe" ] && install -m 0755 "$dir/bin/masque-probe" "$MQ_PROBE_BIN"
+  if [ -s "$dir/systemd/masque.service" ]; then
+    install -m 0644 "$dir/systemd/masque.service" "/etc/systemd/system/${MQ_SVC}.service"
+  else
+    mq_write_unit
+  fi
+  install -d -m 0755 "$MQ_ETC"; install -d -o root -g masque -m 0750 "$MQ_CERTS"
+  systemctl daemon-reload
+  rm -rf "$tmp"
+  if systemctl is-active --quiet "$MQ_SVC"; then
+    systemctl restart "$MQ_SVC"; sleep 2
+    if ! systemctl is-active --quiet "$MQ_SVC" && [ -s "$RSITE_BACKUP/masque-server.prev" ]; then
+      err "新版本启动失败，已回滚旧版本（journalctl -u $MQ_SVC -n 30）"
+      install -m 0755 "$RSITE_BACKUP/masque-server.prev" "$MQ_BIN"; systemctl restart "$MQ_SVC"; return 1
+    fi
+  fi
+  ok "masque-server: ${old:-无} → $(mq_ver_now)"
+}
+
+# ---------------------------------------------------------------- 证书
+# 服务端证书必须是 ECDSA：WARP 风格客户端固定（pin）的就是它的公钥
+mq_copy_cert() { # mq_copy_cert 源证书 源私钥
+  [ -s "$1" ] && [ -s "$2" ] || { err "证书文件不存在: $1"; return 1; }
+  openssl x509 -in "$1" -noout -text 2>/dev/null | grep -q 'id-ecPublicKey' \
+    || { err "证书不是 ECDSA 密钥，WARP 模式客户端无法固定公钥"; return 1; }
+  install -d -o root -g masque -m 0750 "$MQ_CERTS"
+  install -o root -g masque -m 0640 "$1" "$MQ_CERTS/server.crt"
+  install -o root -g masque -m 0640 "$2" "$MQ_CERTS/server.key"
+  MQ_SRV_PUB="$(openssl x509 -in "$MQ_CERTS/server.crt" -noout -pubkey | openssl pkey -pubin -outform DER 2>/dev/null | base64 -w0)"
+  [ -n "$MQ_SRV_PUB" ]
+}
+
+mq_prepare_cert() {
+  case "$MQ_CERT_SRC" in
+    domain)
+      state_load && cert_ok || { err "Reality 站点证书不可用，请改用自签证书"; return 1; }
+      mq_copy_cert "$(cert_dir)/cert.pem" "$(cert_dir)/key.pem" || return 1
+      # 让 acme.sh 续签后自动同步给 MASQUE（acme.sh 默认续签复用私钥，公钥不变）
+      [ -x "$ACME" ] && acme_install_cert >/dev/null 2>&1 || true ;;
+    *)
+      local san="IP:${MQ_ADDR}"
+      valid_domain "$MQ_ADDR" && san="DNS:${MQ_ADDR}"
+      if [ ! -s "$MQ_SELF_DIR/cert.pem" ]; then
+        mkdir -p "$MQ_SELF_DIR" && chmod 700 "$MQ_SELF_DIR"
+        openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -days 3650 \
+          -subj "/CN=${MQ_HOST:-masque}" -addext "subjectAltName=${san}" \
+          -keyout "$MQ_SELF_DIR/key.pem" -out "$MQ_SELF_DIR/cert.pem" >/dev/null 2>&1 \
+          || { err "生成自签证书失败"; return 1; }
+        chmod 600 "$MQ_SELF_DIR/key.pem"
+      fi
+      mq_copy_cert "$MQ_SELF_DIR/cert.pem" "$MQ_SELF_DIR/key.pem" || return 1 ;;
+  esac
+}
+
+mq_cert_sha256() { openssl x509 -in "$MQ_CERTS/server.crt" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f'; }
+
+# acme.sh 续签后调用（rsite cert-hook）：重载 nginx；MASQUE 使用站点证书时同步并重载
+cert_hook() {
+  systemctl reload nginx 2>/dev/null || true
+  mq_load 2>/dev/null && mq_any && [ "$MQ_CERT_SRC" = domain ] || return 0
+  state_load || return 0
+  local old="$MQ_SRV_PUB"
+  mq_copy_cert "$(cert_dir)/cert.pem" "$(cert_dir)/key.pem" || return 1
+  if [ "$MQ_SRV_PUB" != "$old" ]; then
+    mq_save
+    logger -t rsite "MASQUE 服务端公钥已变化：WARP 模式客户端需重新导入配置（rl → 其他协议 → 查看 MASQUE）" 2>/dev/null || true
+  fi
+  systemctl reload "$MQ_SVC" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------- WARP 客户端（ECDSA P-256 密钥对）
+C_KEYS="C_NAME C_IDX C_PRIV C_PUB"
+mq_client_load() { # mq_client_load 文件
+  C_NAME=""; C_IDX=""; C_PRIV=""; C_PUB=""
+  local k v
+  while IFS='=' read -r k v; do
+    case " $C_KEYS " in *" $k "*) ;; *) continue ;; esac
+    v="${v#\'}"; v="${v%\'}"; printf -v "$k" '%s' "$v"
+  done <"$1"
+  [ -n "$C_NAME" ] && [ -n "$C_PUB" ]
+}
+mq_client_files() { ls "$MQ_CLI_DIR"/*.env 2>/dev/null; }
+mq_client_count() { mq_client_files | grep -c . ; }
+mq_client_ip4() { local b="${MQ_POOL4%%.0.0/16}" n=$(( $1 + 2 )); printf '%s.%d.%d' "$b" $(( n / 256 )) $(( n % 256 )); }
+mq_client_ip6() { printf '%s::%x' "${MQ_POOL6%%::/64}" $(( $1 + 2 )); }
+valid_cname() { [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]]; }
+
+# mq_client_new 名称  —— 本机 openssl 生成密钥：私钥 SEC1 DER / 公钥 SPKI DER（base64），与 WARP 客户端格式一致
+mq_client_new() {
+  local name="$1" f idx=0 i tmp
+  valid_cname "$name" || { err "客户端名只能用字母数字 _ -（≤32）"; return 1; }
+  mkdir -p "$MQ_CLI_DIR" && chmod 700 "$MQ_CLI_DIR"
+  [ -e "$MQ_CLI_DIR/$name.env" ] && { err "客户端 ${name} 已存在"; return 1; }
+  for f in $(mq_client_files); do
+    mq_client_load "$f" && [ "${C_IDX:-0}" -ge "$idx" ] && idx=$(( C_IDX + 1 ))
+  done
+  tmp="$(mktemp -d)"; chmod 700 "$tmp"
+  openssl ecparam -name prime256v1 -genkey -noout -out "$tmp/k.pem" 2>/dev/null || { rm -rf "$tmp"; err "生成密钥失败"; return 1; }
+  C_PRIV="$(openssl ec -in "$tmp/k.pem" -outform DER 2>/dev/null | base64 -w0)"
+  C_PUB="$(openssl ec -in "$tmp/k.pem" -pubout -outform DER 2>/dev/null | base64 -w0)"
+  rm -rf "$tmp"
+  [ -n "$C_PRIV" ] && [ -n "$C_PUB" ] || { err "导出密钥失败"; return 1; }
+  C_NAME="$name"; C_IDX="$idx"
+  ( umask 077; : >"$MQ_CLI_DIR/$name.env"; for i in $C_KEYS; do printf "%s='%s'\n" "$i" "${!i}" >>"$MQ_CLI_DIR/$name.env"; done )
+  ok "已生成 WARP 客户端「${name}」的 ECDSA P-256 密钥对（隧道地址 $(mq_client_ip4 "$idx")）"
+}
+
+# ---------------------------------------------------------------- 配置生成
+mq_listener_toml() { # 端口 http3|http2 client_cert|basic
+  printf '\n[[listeners]]\nlisten_addr = "0.0.0.0:%s"\ntransport = "%s"\nshards = 1\n\n[listeners.auth]\nenabled = true\nmode = "%s"\n' "$1" "$2" "$3"
+  if [ "$3" = basic ]; then
+    printf 'stealth = %s\n\n[[listeners.auth.users]]\nusername = "%s"\npassword_hash = "%s"\n' \
+      "$([ "$MQ_RFC_STEALTH" = yes ] && echo true || echo false)" "$MQ_RFC_USER" "$MQ_RFC_HASH"
+  fi
+}
+
+mq_gen_conf() {
+  local f deny='[
+    "127.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "169.254.0.0/16", "172.16.0.0/12",
+    "192.168.0.0/16", "::1/128", "fc00::/7", "fe80::/10",
+]'
+  cat <<EOF
+# 由 rsite 生成 —— 在 rsite 菜单里修改 MASQUE 会覆盖本文件
+[server]
+idle_timeout_secs = 60
+max_connections = 10000
+max_connections_per_ip = 64
+max_pending_auth_per_ip = 8
+max_tunnels_per_connection = 100
+
+[tls]
+cert_path = "${MQ_CERTS}/server.crt"
+key_path = "${MQ_CERTS}/server.key"
+EOF
+  if [ "$MQ_WARP" = yes ]; then
+    printf '\n# ---- WARP 模式：mTLS（ECDSA P-256 客户端公钥白名单）\n'
+    mq_listener_toml "$MQ_WARP_PORT" http3 client_cert
+    [ -n "$MQ_WARP_H2" ] && mq_listener_toml "$MQ_WARP_H2" http2 client_cert
+  fi
+  if [ "$MQ_RFC" = yes ]; then
+    printf '\n# ---- RFC 模式：HTTP Basic 账号密码\n'
+    mq_listener_toml "$MQ_RFC_PORT" http3 basic
+    [ -n "$MQ_RFC_H2" ] && mq_listener_toml "$MQ_RFC_H2" http2 basic
+  fi
+  if [ "$MQ_WARP" = yes ]; then
+    for f in $(mq_client_files); do
+      mq_client_load "$f" || continue
+      printf '\n[[clients]]\nname = "%s"\npublic_key = "%s"\nipv4 = "%s"\n' "$C_NAME" "$C_PUB" "$(mq_client_ip4 "$C_IDX")"
+      [ "$MQ_V6" = yes ] && printf 'ipv6 = "%s"\n' "$(mq_client_ip6 "$C_IDX")"
+    done
+  fi
+  cat <<EOF
+
+[tcp_proxy]
+enabled = true
+connect_timeout_secs = 10
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = ${deny}
+
+[udp_proxy]
+enabled = true
+connect_timeout_secs = 10
+uri_template = "/.well-known/masque/udp/{target_host}/{target_port}/"
+allow_targets = ["0.0.0.0/0", "::/0"]
+deny_targets = ${deny}
+
+[ip_proxy]
+enabled = true
+uri_template = "/.well-known/masque/ip/{target}/{ipproto}/"
+connect_protocols = ["connect-ip", "cf-connect-ip"]
+tun_name = "${MQ_TUN}"
+tun_mtu = ${MQ_MTU}
+tun_offload = $([ "$MQ_OFFLOAD" = yes ] && echo true || echo false)
+ipv4_pool = "${MQ_POOL4}"
+ipv6_pool = "${MQ_POOL6}"
+EOF
+}
+
+# 选一个与本机路由不重叠的隧道地址池
+mq_pick_pool() {
+  local b used
+  used="$(ip -4 route 2>/dev/null; ip -4 addr 2>/dev/null)"
+  if [ -z "$MQ_POOL4" ]; then
+    for b in 10.89 10.98 10.123 10.211 172.29; do
+      grep -qE "(^|[^0-9])${b//./\\.}\." <<<"$used" || { MQ_POOL4="${b}.0.0/16"; break; }
+    done
+    [ -n "$MQ_POOL4" ] || MQ_POOL4="10.89.0.0/16"
+  fi
+  if [ -z "$MQ_POOL6" ]; then
+    used="$(ip -6 route 2>/dev/null; ip -6 addr 2>/dev/null)"
+    for b in fd00:abcd fd00:a5e9 fd5e:9a1c; do
+      grep -qi "$b:" <<<"$used" || { MQ_POOL6="${b}::/64"; break; }
+    done
+    [ -n "$MQ_POOL6" ] || MQ_POOL6="fd00:abcd::/64"
+  fi
+}
+
+# ---------------------------------------------------------------- 转发 / NAT（CONNECT-IP 需要）
+mq_nat_flush() {
+  local ipt t r a
+  for ipt in iptables ip6tables; do
+    command -v "$ipt" >/dev/null 2>&1 || continue
+    for t in nat filter mangle; do
+      "$ipt" -t "$t" -S 2>/dev/null | grep -- "--comment ${MQ_TAG}" | sed 's/^-A /-D /' | while read -r r; do
+        read -ra a <<<"$r"; "$ipt" -t "$t" "${a[@]}" 2>/dev/null
+      done
+    done
+  done
+}
+
+mq_nat() { # mq_nat up|down
+  mq_nat_flush
+  [ "$1" = up ] || return 0
+  mq_load && mq_any || return 0
+  local c=(-m comment --comment "$MQ_TAG") n iface
+  sysctl -qw net.ipv4.ip_forward=1
+  iptables -t nat -A POSTROUTING -s "$MQ_POOL4" ! -o "$MQ_TUN" "${c[@]}" -j MASQUERADE
+  iptables -I FORWARD 1 -i "$MQ_TUN" "${c[@]}" -j ACCEPT
+  iptables -I FORWARD 1 -o "$MQ_TUN" -m conntrack --ctstate RELATED,ESTABLISHED "${c[@]}" -j ACCEPT
+  if [ "$MQ_BLOCK_PRIV" = yes ]; then
+    for n in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 127.0.0.0/8; do
+      iptables -I FORWARD 1 -i "$MQ_TUN" -d "$n" "${c[@]}" -j DROP
+    done
+  fi
+  iptables -t mangle -A FORWARD -i "$MQ_TUN" -p tcp --tcp-flags SYN,RST SYN "${c[@]}" -j TCPMSS --clamp-mss-to-pmtu
+  iptables -t mangle -A FORWARD -o "$MQ_TUN" -p tcp --tcp-flags SYN,RST SYN "${c[@]}" -j TCPMSS --clamp-mss-to-pmtu
+  if [ "$MQ_V6" = yes ] && command -v ip6tables >/dev/null 2>&1; then
+    # 开启 IPv6 转发会让内核忽略 RA，先把出口网卡设为 accept_ra=2，避免 VPS 丢失 IPv6 默认路由
+    iface="$(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    [ -n "$iface" ] && sysctl -qw "net.ipv6.conf.${iface}.accept_ra=2" 2>/dev/null
+    sysctl -qw net.ipv6.conf.all.forwarding=1
+    ip6tables -t nat -A POSTROUTING -s "$MQ_POOL6" ! -o "$MQ_TUN" "${c[@]}" -j MASQUERADE 2>/dev/null \
+      || warn "内核不支持 ip6tables NAT，隧道内 IPv6 不可用"
+    ip6tables -I FORWARD 1 -i "$MQ_TUN" "${c[@]}" -j ACCEPT
+    ip6tables -I FORWARD 1 -o "$MQ_TUN" -m conntrack --ctstate RELATED,ESTABLISHED "${c[@]}" -j ACCEPT
+    if [ "$MQ_BLOCK_PRIV" = yes ]; then
+      for n in fc00::/7 fe80::/10 ::1/128; do ip6tables -I FORWARD 1 -i "$MQ_TUN" -d "$n" "${c[@]}" -j DROP; done
+    fi
+    ip6tables -t mangle -A FORWARD -i "$MQ_TUN" -p tcp --tcp-flags SYN,RST SYN "${c[@]}" -j TCPMSS --clamp-mss-to-pmtu
+    ip6tables -t mangle -A FORWARD -o "$MQ_TUN" -p tcp --tcp-flags SYN,RST SYN "${c[@]}" -j TCPMSS --clamp-mss-to-pmtu
+  fi
+  return 0
+}
+
+mq_write_nat_unit() {
+  cat >/etc/systemd/system/${MQ_NAT_SVC}.service <<EOF
+[Unit]
+Description=rsite MASQUE forwarding / NAT
+After=network-online.target
+Wants=network-online.target
+Before=${MQ_SVC}.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${RSITE_BIN} masque-nat up
+ExecStop=${RSITE_BIN} masque-nat down
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+mq_ufw() {
+  command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active' || return 0
+  local p
+  if [ "$MQ_WARP" = yes ]; then ufw allow "${MQ_WARP_PORT}/udp" >/dev/null; [ -n "$MQ_WARP_H2" ] && ufw allow "${MQ_WARP_H2}/tcp" >/dev/null; fi
+  if [ "$MQ_RFC" = yes ]; then ufw allow "${MQ_RFC_PORT}/udp" >/dev/null; [ -n "$MQ_RFC_H2" ] && ufw allow "${MQ_RFC_H2}/tcp" >/dev/null; fi
+  p="$( { [ "$MQ_WARP" = yes ] && printf '%s/udp %s ' "$MQ_WARP_PORT" "${MQ_WARP_H2:+$MQ_WARP_H2/tcp}"; [ "$MQ_RFC" = yes ] && printf '%s/udp %s' "$MQ_RFC_PORT" "${MQ_RFC_H2:+$MQ_RFC_H2/tcp}"; } )"
+  ok "UFW 已放行: ${p}"
+}
+
+# 写配置 → check-config → 重启；TUN offload 不被内核支持时自动关闭重试
+mq_apply() {
+  local tmp="${MQ_CONF}.rsite-new" out
+  install -d -m 0755 "$MQ_ETC"
+  mq_gen_conf >"$tmp" || { err "生成 MASQUE 配置失败"; return 1; }
+  chown root:masque "$tmp" 2>/dev/null; chmod 0640 "$tmp"
+  if ! out="$("$MQ_BIN" --config "$tmp" check-config 2>&1)"; then
+    err "MASQUE 配置检查失败："; msg "$out" | tail -n 8; rm -f "$tmp"; return 1
+  fi
+  mkdir -p "$RSITE_BACKUP"
+  [ -s "$MQ_CONF" ] && cp -f "$MQ_CONF" "$RSITE_BACKUP/masque-$(date +%Y%m%d-%H%M%S).toml"
+  mv -f "$tmp" "$MQ_CONF"
+  mq_write_nat_unit
+  systemctl enable "$MQ_NAT_SVC" >/dev/null 2>&1; systemctl restart "$MQ_NAT_SVC" || warn "转发/NAT 规则加载失败: journalctl -u $MQ_NAT_SVC"
+  systemctl enable "$MQ_SVC" >/dev/null 2>&1
+  systemctl restart "$MQ_SVC"; sleep 2
+  if ! systemctl is-active --quiet "$MQ_SVC" && [ "$MQ_OFFLOAD" = yes ]; then
+    warn "masque 未能启动，关闭 TUN offload 后重试..."
+    MQ_OFFLOAD=no; mq_save
+    mq_gen_conf >"$MQ_CONF"; chown root:masque "$MQ_CONF"; chmod 0640 "$MQ_CONF"
+    systemctl restart "$MQ_SVC"; sleep 2
+  fi
+  systemctl is-active --quiet "$MQ_SVC" || { err "masque 启动失败: journalctl -u $MQ_SVC -n 40"; return 1; }
+  mq_ufw
+  ok "MASQUE 服务运行中 · $(mq_listen_summary)"
+}
+
+mq_listen_summary() {
+  local s=""
+  [ "$MQ_WARP" = yes ] && s+="WARP(mTLS) udp/${MQ_WARP_PORT}${MQ_WARP_H2:+ + tcp/$MQ_WARP_H2(h2)}  "
+  [ "$MQ_RFC" = yes ] && s+="RFC(Basic) udp/${MQ_RFC_PORT}${MQ_RFC_H2:+ + tcp/$MQ_RFC_H2(h2)}"
+  printf '%s' "${s:-未启用}"
+}
+
+# ---------------------------------------------------------------- 部署前检查：端口 / 协议冲突
+# 输出 rsite 自己占用/预留的端口：「端口 说明」；第二个参数是正在配置的 MASQUE 模式（排除自身）
+# 在子 shell 里读取各状态文件，避免覆盖部署向导中正在填写的变量
+mq_reserved() ( # mq_reserved tcp|udp warp|rfc
+  proto="$1"; self="$2"
+  if [ "$proto" = tcp ]; then
+    if state_load && is_deployed; then
+      printf '%s Reality（xray）\n%s nginx 回落（127.0.0.1）\n80 nginx（HTTP 跳转）\n' "$PORT" "$FALLBACK_PORT"
+    fi
+    venc_load && venc_deployed && printf '%s VLESS-Encryption\n' "$VENC_PORT"
+    mieru_load && mieru_deployed && printf '%s mieru\n' "$MIERU_PORT"
+    mq_load
+    [ "$self" != warp ] && [ "$MQ_WARP" = yes ] && [ -n "$MQ_WARP_H2" ] && printf '%s MASQUE-WARP(h2)\n' "$MQ_WARP_H2"
+    [ "$self" != rfc ] && [ "$MQ_RFC" = yes ] && [ -n "$MQ_RFC_H2" ] && printf '%s MASQUE-RFC(h2)\n' "$MQ_RFC_H2"
+  else
+    mq_load
+    [ "$self" != warp ] && [ "$MQ_WARP" = yes ] && printf '%s MASQUE-WARP\n' "$MQ_WARP_PORT"
+    [ "$self" != rfc ] && [ "$MQ_RFC" = yes ] && printf '%s MASQUE-RFC\n' "$MQ_RFC_PORT"
+  fi
+  return 0
+)
+
+# 端口冲突说明（空 = 无冲突）
+mq_port_conflict() { # tcp|udp 端口 模式
+  local proto="$1" p="$2" self="$3" rp rl o
+  while read -r rp rl; do
+    [ "$rp" = "$p" ] && { printf 'rsite:%s' "$rl"; return 0; }
+  done < <(mq_reserved "$proto" "$self")
+  if [ "$proto" = udp ]; then o="$(port_owner_udp "$p")"; else o="$(port_owner "$p")"; fi
+  [ -n "$o" ] && [ "$o" != masque-server ] && printf 'proc:%s' "$o"
+  return 0
+}
+
+mq_free_port() { # tcp|udp 起始端口 模式
+  local p="$2" i
+  for i in $(seq 1 300); do
+    p=$(( p + 1 )); [ "$p" -gt 65535 ] && p=2000
+    [ -z "$(mq_port_conflict "$1" "$p" "$3")" ] && { printf '%s' "$p"; return 0; }
+  done
+  printf '%s' "$2"
+}
+
+# mq_port_check 变量名 tcp|udp 用途 模式 —— 有冲突时给出解决方案选项
+mq_port_check() {
+  local __v="$1" proto="$2" what="$3" self="$4" __p __cf __alt __pid __unit __c __np __PU
+  __PU="$(tr 'a-z' 'A-Z' <<<"$proto")"
+  while :; do
+    __p="${!__v}"
+    __cf="$(mq_port_conflict "$proto" "$__p" "$self")"
+    if [ -z "$__cf" ]; then ok "${what}: ${__PU} ${__p} 可用"; return 0; fi
+    warn "${what}: ${__PU} ${__p} 已被「${__cf#*:}」占用"
+    __alt="$(mq_free_port "$proto" "$__p" "$self")"
+    __unit=""
+    if [ "${__cf%%:*}" = proc ]; then __pid="$(port_pid "$proto" "$__p")"; __unit="$(pid_unit "$__pid")"; fi
+    msg "  解决方案："
+    msg "  1) 改用其他端口（推荐，空闲端口: ${__alt}）"
+    if [ -n "$__unit" ]; then
+      if [ "$__unit" = xray.service ] && state_load && is_deployed && [ "$proto" = tcp ] && [ "$__p" = "$PORT" ]; then
+        msg "     （占用者是本机 Reality，不建议停止）"
+        __unit=""
+      else
+        msg "  2) 停止并禁用占用者「${__unit}」，把端口让给 MASQUE"
+      fi
+    fi
+    msg "  3) 忽略冲突继续（服务大概率启动失败）"
+    msg "  0) 取消部署"
+    ask __c "请选择" 1
+    case "$__c" in
+      1) while :; do ask __np "新端口" "$__alt"; valid_port "$__np" && break; warn "端口无效"; done
+         printf -v "$__v" '%s' "$__np" ;;
+      2) [ -n "$__unit" ] || { warn "无效选择"; continue; }
+         confirm "确定停止并禁用 ${__unit}？（该服务提供的节点将失效）" n || continue
+         systemctl disable --now "$__unit" >/dev/null 2>&1; sleep 1 ;;
+      3) warn "已忽略 ${__PU} ${__p} 的冲突"; return 0 ;;
+      0) return 1 ;;
+      *) warn "无效选择" ;;
+    esac
+  done
+}
+
+# 总体环境报告：Reality / 443 / 其他 QUIC 协议 / TUN / 地址池
+mq_env_report() {
+  local t443 u443 r_rsite=0 others f u sv
+  title "部署前检查：Reality / 443 / 协议冲突"
+  if [ ! -c /dev/net/tun ]; then
+    err "本机没有 /dev/net/tun，MASQUE（CONNECT-IP）无法运行"
+    msg "  解决：OpenVZ/LXC 小鸡需在服务商面板开启 TUN/TAP；KVM 执行 modprobe tun 后重试"
+    return 1
+  fi
+  ok "/dev/net/tun 可用"
+  t443="$(port_owner 443)"; u443="$(port_owner_udp 443)"
+  state_load && is_deployed && [ "$PORT" = 443 ] && r_rsite=1
+  others="$(grep -ls '"reality"\|realitySettings' /usr/local/etc/xray/*.json /etc/xray/*.json /etc/sing-box/*.json \
+            /usr/local/x-ui/bin/config.json /etc/s-ui/*.json 2>/dev/null | grep -v "^${XRAY_CONF}$" | tr '\n' ' ')"
+  kv "TCP 443" "${t443:-空闲}$([ "$r_rsite" = 1 ] && printf '（rsite Reality）')" \
+     "UDP 443" "${u443:-空闲}"
+  [ -n "$others" ] && kv "其他 Reality 配置" "$others"
+  if [ "$r_rsite" = 1 ] || [ "$t443" = xray ] || [ "$t443" = sing-box ]; then
+    msg "  ${C_G}→ 已有 Reality 占用 TCP 443。MASQUE 默认走 HTTP/3（UDP），可与 Reality 共用 443 端口号互不影响；${C_0}"
+    msg "  ${C_G}  只有「HTTP/2 回落」需要 TCP，必须换用其他 TCP 端口。${C_0}"
+  fi
+  if [ -n "$u443" ] && [ "$u443" != masque-server ]; then
+    msg "  ${C_Y}→ UDP 443 已被 ${u443} 占用（Hysteria2 / TUIC / 其他 QUIC 服务？），MASQUE 需改端口或停用它，下一步会给出选项。${C_0}"
+  fi
+  # 其他代理服务
+  for sv in sing-box hysteria-server hysteria tuic tuic-server s-ui x-ui 3x-ui juicity-server naiveproxy caddy warp-svc; do
+    systemctl is-active --quiet "$sv" 2>/dev/null && u+="${sv} "
+  done
+  [ -n "$u" ] && kv "运行中的其他代理服务" "$u"
+  if ip link 2>/dev/null | grep -qiE 'CloudflareWARP|wgcf|warp[0-9]*:'; then
+    warn "检测到本机 WARP 网卡：若它接管了默认路由，MASQUE 的回包会被带偏；建议 WARP 只作为 Xray 出站使用"
+  fi
+  msg "  对外监听（非 127.0.0.1）："
+  ss -Hlntup 2>/dev/null | while read -r f _ _ _ loc _ proc; do
+    case "$loc" in 127.*|"[::1]"*|::1*|"[::ffff:127."*) continue ;; esac
+    printf '    %-4s %-6s %s\n' "$f" "${loc##*:}" "$(grep -o '"[^"]*"' <<<"$proc" | head -n1 | tr -d '"')"
+  done | sort -u -k1,2
+  return 0
+}
+
+# ---------------------------------------------------------------- 输出客户端配置
+mq_warp_client_out() { # 需先 mq_client_load
+  local ip4 ip6=""; ip4="$(mq_client_ip4 "$C_IDX")"; [ "$MQ_V6" = yes ] && ip6="$(mq_client_ip6 "$C_IDX")"
+  msg "${C_W}[WARP 客户端 ${C_NAME}] Mihomo / Clash.Meta（type: masque）：${C_0}"
+  cat <<EOF
+  - name: "MASQUE-${C_NAME}"
+    type: masque
+    server: ${MQ_ADDR}
+    port: ${MQ_WARP_PORT}
+    private-key: ${C_PRIV}
+    public-key: ${MQ_SRV_PUB}
+    ip: ${ip4}/32
+EOF
+  [ -n "$ip6" ] && printf '    ipv6: %s/128\n' "$ip6"
+  printf '    mtu: %s\n    udp: true\n' "$MQ_MTU"
+  [ -n "$MQ_WARP_H2" ] && msg "    # 网络封 UDP 时：port 改为 ${MQ_WARP_H2}，并加一行  network: h2"
+  local pem js="${MQ_CLI_DIR}/${C_NAME}.usque.json"
+  pem="$(openssl x509 -in "$MQ_CERTS/server.crt" -noout -pubkey 2>/dev/null)"
+  ( umask 077; jq -n --arg pk "$C_PRIV" --arg e "$MQ_ADDR" --arg pem "$pem" --arg i4 "$ip4" --arg i6 "$ip6" \
+      --arg v6 "$(valid_ipv6 "$MQ_ADDR" && echo 1)" '
+    {private_key:$pk,
+     endpoint_v4:(if $v6=="1" then "" else $e end), endpoint_v6:(if $v6=="1" then $e else "" end),
+     endpoint_h2_v4:(if $v6=="1" then "" else $e end), endpoint_h2_v6:(if $v6=="1" then $e else "" end),
+     endpoint_pub_key:($pem+"\n"), license:"", id:"", access_token:"", ipv4:$i4, ipv6:$i6}' >"$js" )
+  msg "${C_W}usque（JSON 已保存到 ${js}）：${C_0}"
+  cat "$js"
+  msg "  启动: usque -c ${C_NAME}.usque.json socks -P ${MQ_WARP_PORT}${MQ_WARP_H2:+     （HTTP/2：usque -c ${C_NAME}.usque.json socks -P ${MQ_WARP_H2} --http2）}"
+}
+
+mq_rfc_out() {
+  local host="$MQ_HOST" self=0 fp=""
+  [ "$MQ_CERT_SRC" = domain ] || { self=1; host="$MQ_ADDR"; fp="$(mq_cert_sha256)"; }
+  msg "${C_W}[RFC 账号密码模式] 通用参数：${C_0}"
+  kv "服务器" "$host" "端口" "${MQ_RFC_PORT}（UDP / HTTP/3）${MQ_RFC_H2:+，HTTP/2: TCP ${MQ_RFC_H2}}" \
+     "用户名" "$MQ_RFC_USER" "密码" "$MQ_RFC_PASS" "认证" "HTTP Basic（Proxy-Authorization）" \
+     "CONNECT-IP 路径" "/.well-known/masque/ip/{target}/{ipproto}/" \
+     "CONNECT-UDP 路径" "/.well-known/masque/udp/{target_host}/{target_port}/" \
+     "证书" "$([ "$self" = 1 ] && echo "自签（SHA-256 指纹 ${fp}）" || echo "$host 正式证书")"
+  line
+  msg "${C_W}Surge：${C_0}"
+  printf '[Proxy]\nMASQUE-RFC = masque, %s, %s, username=%s, password=%s%s\n' "$(link_host "$host")" "$MQ_RFC_PORT" \
+    "$MQ_RFC_USER" "$MQ_RFC_PASS" "$([ "$self" = 1 ] && printf ', server-cert-fingerprint-sha256=%s' "$fp")"
+  line
+  msg "${C_W}Xray 出站（需支持 masque 的 Xray 版本）：${C_0}"
+  jq -n --arg a "$host" --argjson p "$MQ_RFC_PORT" --arg u "$MQ_RFC_USER" --arg pw "$MQ_RFC_PASS" \
+     --arg sni "$host" --arg fp "$fp" '
+    {tag:"masque-rfc", protocol:"masque", settings:{address:$a, port:$p},
+     streamSettings:{network:"masque", security:"tls",
+       masqueSettings:{user:$u, pass:$pw},
+       tlsSettings:({serverName:$sni} + (if $fp=="" then {} else {pinnedPeerCertSha256:$fp} end))}}'
+  msg "提示：mihomo 的 masque 只支持 WARP 双向证书模式，账号密码模式请用 Surge / Xray 等 RFC 客户端。"
+}
+
+mq_show() {
+  mq_load && mq_any || { warn "尚未部署 MASQUE"; return 1; }
+  local f out="${RSITE_DIR}/masque-clients.txt"
+  {
+    title "MASQUE 节点"
+    kv "服务状态" "$(systemctl is-active "$MQ_SVC" 2>/dev/null)" "版本" "$(mq_ver_now)" \
+       "监听" "$(mq_listen_summary)" "连接地址" "$MQ_ADDR" \
+       "隧道地址池" "${MQ_POOL4}$([ "$MQ_V6" = yes ] && printf ' / %s' "$MQ_POOL6")" "MTU" "$MQ_MTU" \
+       "服务端公钥" "$MQ_SRV_PUB"
+    if [ "$MQ_WARP" = yes ]; then
+      line
+      for f in $(mq_client_files); do mq_client_load "$f" && { mq_warp_client_out; line; }; done
+    fi
+    [ "$MQ_RFC" = yes ] && { line; mq_rfc_out; }
+    line
+    msg "云服务商安全组/防火墙需放行上面的 UDP 端口（HTTP/3），否则客户端握手超时。"
+  } | tee "$out"
+  chmod 600 "$out"
+  msg "以上配置含私钥/密码，已保存到 ${out}（仅 root 可读），不要外传。"
+}
+
+# ---------------------------------------------------------------- 部署
+# mq_deploy warp|rfc
+mq_deploy() {
+  local mode="$1" c tmp cname="" newcli=0 def
+  mq_load || true
+  state_load 2>/dev/null || true
+  if [ "$mode" = warp ]; then
+    title "部署 MASQUE · WARP 双向证书模式（mTLS / ECDSA P-256）"
+    msg "客户端用 ECDSA P-256 私钥做 TLS 客户端证书，服务端按公钥白名单放行；客户端固定服务端 ECDSA 公钥。"
+    msg "与 Cloudflare WARP 的 MASQUE 规范一致：mihomo（type: masque）、usque 等可直接使用。"
+  else
+    title "部署 MASQUE · RFC 账号密码模式（HTTP Basic）"
+    msg "RFC 9484 CONNECT-IP / RFC 9298 CONNECT-UDP，HTTP Basic 认证：Surge、Xray masque 出站等通用客户端。"
+  fi
+  mq_env_report || return 1
+  apt_install curl jq openssl iptables tar >/dev/null || return 1
+
+  step "1" "连接地址"
+  [ -z "$MQ_ADDR" ] && MQ_ADDR="${SERVER_IP:-$(detect_ip || true)}"
+  while :; do
+    ask MQ_ADDR "服务器公网 IP（WARP 客户端只认 IP）" "$MQ_ADDR"
+    valid_ipv4 "$MQ_ADDR" || valid_ipv6 "$MQ_ADDR" && break; warn "请填 IP 地址"
+  done
+
+  step "2" "端口（会逐一检查冲突）"
+  if [ "$mode" = warp ]; then
+    def="${MQ_WARP_PORT:-443}"; [ "$MQ_RFC" = yes ] && [ "$MQ_RFC_PORT" = "$def" ] && def=4443
+    while :; do ask MQ_WARP_PORT "HTTP/3 端口（UDP）" "$def"; valid_port "$MQ_WARP_PORT" && break; done
+    mq_port_check MQ_WARP_PORT udp "WARP 模式 HTTP/3" warp || { warn "已取消"; return 1; }
+    if confirm "额外开启 HTTP/2 回落（TCP，用于封 UDP 的网络）？" "$([ -n "$MQ_WARP_H2" ] && echo y || echo n)"; then
+      [ -n "$MQ_WARP_H2" ] || MQ_WARP_H2="$(mq_free_port tcp 2051 warp)"
+      while :; do ask MQ_WARP_H2 "HTTP/2 端口（TCP）" "$MQ_WARP_H2"; valid_port "$MQ_WARP_H2" && break; done
+      mq_port_check MQ_WARP_H2 tcp "WARP 模式 HTTP/2" warp || { warn "已取消"; return 1; }
+    else MQ_WARP_H2=""; fi
+  else
+    def="${MQ_RFC_PORT:-443}"; [ "$MQ_WARP" = yes ] && [ "$MQ_WARP_PORT" = "$def" ] && def=4443
+    while :; do ask MQ_RFC_PORT "HTTP/3 端口（UDP）" "$def"; valid_port "$MQ_RFC_PORT" && break; done
+    mq_port_check MQ_RFC_PORT udp "RFC 模式 HTTP/3" rfc || { warn "已取消"; return 1; }
+    if confirm "额外开启 HTTP/2 回落（TCP，用于封 UDP 的网络）？" "$([ -n "$MQ_RFC_H2" ] && echo y || echo n)"; then
+      [ -n "$MQ_RFC_H2" ] || MQ_RFC_H2="$(mq_free_port tcp 2052 rfc)"
+      while :; do ask MQ_RFC_H2 "HTTP/2 端口（TCP）" "$MQ_RFC_H2"; valid_port "$MQ_RFC_H2" && break; done
+      mq_port_check MQ_RFC_H2 tcp "RFC 模式 HTTP/2" rfc || { warn "已取消"; return 1; }
+    else MQ_RFC_H2=""; fi
+  fi
+  # 同一 MASQUE 进程内两个监听不能撞端口（上面的检查已排除，这里兜底）
+  if [ "$MQ_WARP" = yes ] || [ "$mode" = warp ]; then
+    if { [ "$MQ_RFC" = yes ] || [ "$mode" = rfc ]; } && [ "$MQ_WARP_PORT" = "$MQ_RFC_PORT" ]; then
+      err "WARP 与 RFC 模式不能使用同一个 UDP 端口（认证方式由 TLS 握手决定）"; return 1
+    fi
+  fi
+
+  step "3" "认证"
+  if [ "$mode" = warp ]; then
+    if [ "$(mq_client_count)" -gt 0 ]; then
+      msg "已有 $(mq_client_count) 个 WARP 客户端密钥，将保留。"
+      if confirm "再新增一个客户端？" n; then newcli=1; fi
+    else
+      newcli=1
+    fi
+    if [ "$newcli" = 1 ]; then
+      while :; do ask cname "客户端名称（字母数字 _ -）" "device$(( $(mq_client_count) + 1 ))"; valid_cname "$cname" && [ ! -e "$MQ_CLI_DIR/$cname.env" ] && break; warn "名称无效或已存在"; done
+    fi
+  else
+    while :; do ask MQ_RFC_USER "用户名" "$MQ_RFC_USER"; [[ "$MQ_RFC_USER" =~ ^[A-Za-z0-9._-]{1,32}$ ]] && break; warn "用户名只能用字母数字 . _ -"; done
+    tmp="${MQ_RFC_PASS:-$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)}"
+    while :; do ask MQ_RFC_PASS "密码（回车用随机）" "$tmp"; [[ "$MQ_RFC_PASS" =~ ^[A-Za-z0-9._~-]{8,64}$ ]] && break; warn "密码 8~64 位，只能用字母数字 . _ ~ -"; done
+    if confirm "开启 stealth（未认证请求一律返回空 404，不暴露 407；Surge 兼容）？" "$([ "$MQ_RFC_STEALTH" = yes ] && echo y || echo n)"; then MQ_RFC_STEALTH=yes; else MQ_RFC_STEALTH=no; fi
+  fi
+
+  step "4" "服务端证书（必须是 ECDSA）"
+  local can_domain=0 old_src="$MQ_CERT_SRC"
+  state_load && is_deployed && cert_ok && can_domain=1
+  if [ "$can_domain" = 1 ]; then
+    msg "  1) 复用 Reality 站点证书 ${DOMAIN}（ECC，acme.sh 自动续签并同步；RFC 客户端可正常校验，推荐）"
+    msg "  2) 自签 ECDSA P-256 证书（10 年；RFC 客户端需固定指纹）"
+    ask c "选择" "$([ "$MQ_CERT_SRC" = self ] && echo 2 || echo 1)"
+    if [ "$c" = 2 ]; then MQ_CERT_SRC=self; else MQ_CERT_SRC=domain; MQ_HOST="$DOMAIN"; fi
+  else
+    msg "未检测到可用的 Reality 站点证书，使用自签 ECDSA P-256 证书。"
+    MQ_CERT_SRC=self
+  fi
+  [ "$MQ_CERT_SRC" = self ] && MQ_HOST="$MQ_ADDR"
+  if [ -n "$old_src" ] && [ "$old_src" != "$MQ_CERT_SRC" ] && [ "$(mq_client_count)" -gt 0 ]; then
+    warn "更换证书来源会改变服务端公钥，已有 WARP 客户端都需要重新导入配置"
+  fi
+
+  mq_pick_pool
+  if ip -6 route show default 2>/dev/null | grep -q .; then MQ_V6=yes; else MQ_V6=no; fi
+  confirm "隧道内禁止访问内网/保留地址（10/8、172.16/12、192.168/16 等）？" "$([ "$MQ_BLOCK_PRIV" = yes ] && echo y || echo n)" && MQ_BLOCK_PRIV=yes || MQ_BLOCK_PRIV=no
+
+  title "确认 MASQUE 配置"
+  if [ "$mode" = warp ]; then
+    kv "模式" "WARP 双向证书（mTLS / ECDSA P-256）" "HTTP/3" "UDP ${MQ_WARP_PORT}" "HTTP/2 回落" "${MQ_WARP_H2:-关闭}" \
+       "新客户端" "${cname:-（不新增）}"
+  else
+    kv "模式" "RFC 账号密码（HTTP Basic）" "HTTP/3" "UDP ${MQ_RFC_PORT}" "HTTP/2 回落" "${MQ_RFC_H2:-关闭}" \
+       "用户名" "$MQ_RFC_USER" "stealth" "$MQ_RFC_STEALTH"
+  fi
+  kv "连接地址" "$MQ_ADDR" "证书" "$([ "$MQ_CERT_SRC" = domain ] && echo "站点证书 $MQ_HOST" || echo 自签)" \
+     "隧道地址池" "${MQ_POOL4}$([ "$MQ_V6" = yes ] && printf ' / %s' "$MQ_POOL6" || printf '（本机无 IPv6，仅 IPv4）')" \
+     "内网拦截" "$MQ_BLOCK_PRIV" "IP 转发 / NAT" "自动配置（${MQ_NAT_SVC}.service）"
+  line
+  confirm "开始部署？" y || { warn "已取消"; return 1; }
+
+  mq_install_bin || return 1
+  mq_prepare_cert || return 1
+  if [ "$mode" = warp ]; then
+    [ "$newcli" = 1 ] && { mq_client_new "$cname" || return 1; }
+    MQ_WARP=yes
+  else
+    MQ_RFC_HASH="$(printf '%s' "$MQ_RFC_PASS" | "$MQ_BIN" hash-password 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+    [[ "$MQ_RFC_HASH" == '$argon2id$'* ]] || { err "生成密码哈希失败"; return 1; }
+    MQ_RFC=yes
+  fi
+  mq_save
+  mq_apply || return 1
+  mq_show
+}
+
+# ---------------------------------------------------------------- 客户端管理 / 诊断 / 删除
+mq_client_menu() {
+  mq_load && mq_any || { warn "尚未部署 MASQUE"; return 1; }
+  local c n f
+  title "MASQUE 客户端管理"
+  if [ "$MQ_WARP" = yes ]; then
+    msg "WARP 客户端："
+    for f in $(mq_client_files); do mq_client_load "$f" && msg "  - ${C_NAME}  $(mq_client_ip4 "$C_IDX")"; done
+  fi
+  [ "$MQ_RFC" = yes ] && msg "RFC 账号：${MQ_RFC_USER}"
+  msg ""
+  msg "  1) 新增 WARP 客户端（生成新的 ECDSA 密钥对）"
+  msg "  2) 删除 WARP 客户端（立即断开并吊销）"
+  msg "  3) 修改 RFC 模式密码"
+  msg "  0) 返回"
+  ask c "请选择 [0-3]" ""
+  case "$c" in
+    1) [ "$MQ_WARP" = yes ] || { warn "未启用 WARP 模式"; return 1; }
+       while :; do ask n "客户端名称" "device$(( $(mq_client_count) + 1 ))"; valid_cname "$n" && [ ! -e "$MQ_CLI_DIR/$n.env" ] && break; warn "名称无效或已存在"; done
+       mq_client_new "$n" && mq_apply && { mq_client_load "$MQ_CLI_DIR/$n.env"; line; mq_warp_client_out; } ;;
+    2) ask n "要删除的客户端名称" ""
+       [ -f "$MQ_CLI_DIR/$n.env" ] || { warn "不存在"; return 1; }
+       [ "$(mq_client_count)" -le 1 ] && { warn "至少保留一个客户端（不需要了可删除 WARP 模式）"; return 1; }
+       rm -f "$MQ_CLI_DIR/$n.env" "$MQ_CLI_DIR/$n.usque.json"; mq_apply && ok "已吊销 ${n}" ;;
+    3) [ "$MQ_RFC" = yes ] || { warn "未启用 RFC 模式"; return 1; }
+       while :; do ask n "新密码" "$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | cut -c1-24)"; [[ "$n" =~ ^[A-Za-z0-9._~-]{8,64}$ ]] && break; warn "8~64 位字母数字"; done
+       MQ_RFC_PASS="$n"
+       MQ_RFC_HASH="$(printf '%s' "$MQ_RFC_PASS" | "$MQ_BIN" hash-password 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+       [[ "$MQ_RFC_HASH" == '$argon2id$'* ]] || { err "生成哈希失败"; return 1; }
+       mq_save; mq_apply && { line; mq_rfc_out; } ;;
+  esac
+}
+
+mq_doctor() {
+  mq_load && mq_any || { warn "尚未部署 MASQUE"; return 1; }
+  title "MASQUE 诊断"
+  local pass=0 fail=0
+  mchk() { if eval "$2" >/dev/null 2>&1; then ok "$1"; pass=$((pass+1)); else printf '%s[FAIL]%s %s\n' "$C_R" "$C_0" "$1"; [ -n "${3:-}" ] && msg "       → $3"; fail=$((fail+1)); fi; }
+  mchk "masque 服务运行中" "systemctl is-active --quiet $MQ_SVC" "journalctl -u $MQ_SVC -n 40"
+  mchk "转发/NAT 服务已加载" "systemctl is-active --quiet $MQ_NAT_SVC" "systemctl restart $MQ_NAT_SVC"
+  mchk "配置检查通过" "$MQ_BIN --config $MQ_CONF check-config"
+  [ "$MQ_WARP" = yes ] && mchk "UDP ${MQ_WARP_PORT} 由 masque-server 监听（WARP）" "[ \"\$(port_owner_udp $MQ_WARP_PORT)\" = masque-server ]"
+  [ "$MQ_RFC" = yes ] && mchk "UDP ${MQ_RFC_PORT} 由 masque-server 监听（RFC）" "[ \"\$(port_owner_udp $MQ_RFC_PORT)\" = masque-server ]"
+  mchk "IPv4 转发已开启" "[ \"\$(sysctl -n net.ipv4.ip_forward)\" = 1 ]"
+  mchk "NAT 规则存在（${MQ_POOL4}）" "iptables -t nat -S POSTROUTING | grep -q -- '--comment ${MQ_TAG}'"
+  mchk "隧道网卡 ${MQ_TUN} 存在" "ip link show $MQ_TUN"
+  if [ -n "$MQ_SRV_PUB" ]; then
+    mchk "服务端证书公钥与已下发给 WARP 客户端的一致" \
+      "[ \"\$(openssl x509 -in $MQ_CERTS/server.crt -noout -pubkey | openssl pkey -pubin -outform DER | base64 -w0)\" = \"$MQ_SRV_PUB\" ]" \
+      "证书私钥变了：重新「查看 MASQUE 配置」并在客户端重新导入"
+  fi
+  line
+  msg "masque-server 自带主机诊断（只读）："
+  "$MQ_BIN" --config "$MQ_CONF" doctor 2>&1 | tail -n 20 | sed 's/^/  /'
+  line
+  msg "通过 ${pass} 项，失败 ${fail} 项。外部连通性可在电脑上用 masque-probe 测试（见 README）。"
+}
+
+mq_remove() {
+  mq_load && mq_any || { warn "未部署 MASQUE"; return 0; }
+  local c
+  title "删除 MASQUE"
+  msg "当前: $(mq_listen_summary)"
+  msg "  1) 只删除 WARP 双向证书模式"
+  msg "  2) 只删除 RFC 账号密码模式"
+  msg "  3) 全部删除并卸载 masque-server"
+  msg "  0) 返回"
+  ask c "请选择 [0-3]" ""
+  case "$c" in
+    1) MQ_WARP=no; MQ_WARP_H2=""; confirm "同时删除所有 WARP 客户端密钥？" y && rm -rf "$MQ_CLI_DIR" ;;
+    2) MQ_RFC=no; MQ_RFC_H2=""; MQ_RFC_PASS=""; MQ_RFC_HASH="" ;;
+    3) mq_purge; return ;;
+    *) return 0 ;;
+  esac
+  if mq_any; then mq_save; mq_apply
+  else mq_purge quiet; fi
+}
+
+mq_purge() {
+  [ "${1:-}" = quiet ] || confirm "停止并删除 MASQUE 服务、配置、证书副本、客户端密钥？" n || return 0
+  systemctl disable --now "$MQ_SVC" >/dev/null 2>&1
+  systemctl disable --now "$MQ_NAT_SVC" >/dev/null 2>&1
+  mq_nat_flush
+  rm -f "/etc/systemd/system/${MQ_SVC}.service" "/etc/systemd/system/${MQ_NAT_SVC}.service"
+  systemctl daemon-reload 2>/dev/null || true
+  rm -rf "$MQ_ETC" "$MQ_STATE" "$MQ_CLI_DIR" "$MQ_SELF_DIR" "${RSITE_DIR}/masque-clients.txt"
+  rm -f "$MQ_BIN" "$MQ_PROBE_BIN"
+  ok "已删除 MASQUE（IP 转发 sysctl 保持当前值，重启后恢复系统默认）"
+}
+
+mq_status() {
+  if mq_load && mq_any; then printf '%s · %s' "$(systemctl is-active "$MQ_SVC" 2>/dev/null)" "$(mq_listen_summary)"
+  else printf '未部署'; fi
+}
+
 # ---------------------------------------------------------------- 子菜单
 other_menu() {
   while :; do
     local vs ms
     vs="$(venc_deployed && systemctl is-active "$VENC_SVC" 2>/dev/null || echo 未部署)"
     ms="$(mieru_deployed && systemctl is-active "$MIERU_SVC" 2>/dev/null || echo 未部署)"
-    title "其他协议：mieru / VLESS Encryption"
+    title "其他协议：mieru / VLESS Encryption / MASQUE"
     msg "VLESS Encryption: ${vs}    mieru: ${ms}"
+    msg "MASQUE: $(mq_status)"
     msg ""
     msg "  1) 部署 / 重装 VLESS Encryption"
     msg "  2) 查看 VLESS Encryption 链接"
@@ -1756,9 +2757,16 @@ other_menu() {
     msg "  4) 部署 / 重装 mieru"
     msg "  5) 查看 mieru 链接"
     msg "  6) 删除 mieru"
-    msg "  7) 重启两者服务"
+    msg "  7) 重启以上全部服务"
+    msg "  ---- MASQUE（HTTP/3 CONNECT-IP，可与 Reality 共用 443：UDP vs TCP）----"
+    msg "  8) 部署 MASQUE · WARP 双向证书模式（mTLS，ECDSA P-256 公私钥对）"
+    msg "  9) 部署 MASQUE · RFC 标准账号密码模式（HTTP Basic）"
+    msg " 10) 查看 MASQUE 客户端配置（mihomo / usque / Surge / Xray）"
+    msg " 11) MASQUE 客户端管理（新增/吊销 WARP 设备、改密码）"
+    msg " 12) MASQUE 诊断"
+    msg " 13) 删除 MASQUE"
     msg "  0) 返回"
-    local c; ask c "请选择 [0-7]" ""
+    local c; ask c "请选择 [0-13]" ""
     case "$c" in
       1) venc_deploy ;;
       2) venc_show ;;
@@ -1766,7 +2774,14 @@ other_menu() {
       4) mieru_deploy ;;
       5) mieru_show ;;
       6) mieru_remove ;;
-      7) systemctl restart "$VENC_SVC" 2>/dev/null; systemctl restart "$MIERU_SVC" 2>/dev/null; ok "已尝试重启" ;;
+      7) systemctl restart "$VENC_SVC" 2>/dev/null; systemctl restart "$MIERU_SVC" 2>/dev/null
+         mq_load && mq_any && systemctl restart "$MQ_NAT_SVC" "$MQ_SVC" 2>/dev/null; ok "已尝试重启" ;;
+      8) mq_deploy warp ;;
+      9) mq_deploy rfc ;;
+      10) mq_show ;;
+      11) mq_client_menu ;;
+      12) mq_doctor ;;
+      13) mq_remove ;;
       0) return 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -1797,13 +2812,14 @@ main_menu() {
     msg "  6) 服务管理"
     msg "  7) 防偷跑 / 访问统计"
     msg "  8) 系统优化 / 加固（更新源/DNS/TCP/SSH/UFW/BBR）"
-    msg "  9) 其他协议：mieru / VLESS Encryption"
-    msg " 10) 卸载"
+    msg "  9) 其他协议：mieru / VLESS Encryption / MASQUE"
+    msg " 10) 核心管理：Xray 升级 / sing-box 安装与升级"
+    msg " 11) 卸载"
     msg "  0) 退出"
     msg ""
     msg "${C_G}下次直接输入 rl 即可调出本菜单${C_0}（等同 rsite）"
-    msg "快捷命令: rl link | rl doctor | rl install"
-    local c; ask c "请选择 [0-10]" ""
+    msg "快捷命令: rl link | rl doctor | rl install | rl masque | rl core"
+    local c; ask c "请选择 [0-11]" ""
     case "$c" in
       1) wizard ;;
       2) show_node ;;
@@ -1814,7 +2830,8 @@ main_menu() {
       7) abuse_menu ;;
       8) harden_menu ;;
       9) other_menu ;;
-      10) uninstall ;;
+      10) core_menu ;;
+      11) uninstall ;;
       0|q|Q) exit 0 ;;
       *) warn "无效选择"; continue ;;
     esac
@@ -1830,10 +2847,14 @@ main() {
     install) apt_install curl jq >/dev/null || exit 1; wizard ;;
     link) show_node ;;
     doctor) doctor ;;
+    masque) mq_show ;;
+    core) apt_install curl jq >/dev/null || exit 1; core_menu ;;
+    cert-hook) cert_hook ;;                 # acme.sh 续签后调用
+    masque-nat) mq_nat "${2:-up}" ;;        # rsite-masque-nat.service 调用
     -v|--version) msg "$RSITE_VERSION" ;;
-    -h|--help) sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' ;;
+    -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     "") apt_install curl jq || exit 1; main_menu ;;
-    *) err "未知参数: $1（可用: install / link / doctor）"; exit 1 ;;
+    *) err "未知参数: $1（可用: install / link / doctor / masque / core）"; exit 1 ;;
   esac
 }
 
