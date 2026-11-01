@@ -20,7 +20,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.4.0"
+RSITE_VERSION="1.4.1"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -2454,8 +2454,36 @@ mq_env_report() {
 }
 
 # ---------------------------------------------------------------- 输出客户端配置
+# WARP 客户端用的 SNI：客户端只校验固定的服务端公钥，SNI 可以随意填。
+# 默认用自己的域名（站点证书域名 / Reality 域名），不用 WARP 官方的
+# consumer-masque.cloudflareclient.com（国内被封，且指向非 Cloudflare IP 更可疑）
+mq_sni() {
+  if [ "$MQ_CERT_SRC" = domain ] && valid_domain "$MQ_HOST"; then printf '%s' "$MQ_HOST"; return; fi
+  ( state_load 2>/dev/null && valid_domain "$DOMAIN" && printf '%s' "$DOMAIN" )
+}
+
+mq_shadowrocket_out() { # 需先 mq_client_load
+  local ip4 sni; ip4="$(mq_client_ip4 "$C_IDX")"; sni="$(mq_sni)"
+  msg "${C_W}[WARP 客户端 ${C_NAME}] Shadowrocket（小火箭）→ 添加节点 → 类型 MASQUE：${C_0}"
+  kv "地址" "$MQ_ADDR" \
+     "端口" "${MQ_WARP_PORT}$([ -n "$MQ_WARP_H2" ] && printf '（打开 HTTP2 时改为 %s）' "$MQ_WARP_H2")" \
+     "私钥" "$C_PRIV" \
+     "公钥" "$MQ_SRV_PUB" \
+     "子网 IP" "${ip4}（必须填这个，不能用默认 10.0.2.2）" \
+     "DNS" "1.1.1.1" \
+     "MTU" "$MQ_MTU" \
+     "SNI" "${sni:-（未部署 Reality 域名：可填任意常见域名，不要用默认的 cloudflareclient.com）}" \
+     "心跳间隔" "30" \
+     "HTTP2" "$([ -n "$MQ_WARP_H2" ] && echo "关（UDP 被限速/封锁时打开，并把端口改为 ${MQ_WARP_H2}）" || echo "关（服务端未开 HTTP/2 回落）")" \
+     "UDP 转发" "开"
+  msg "  每台设备用自己的私钥和子网 IP，不要多台共用；需要更多设备在「MASQUE 客户端管理」里新增。"
+}
+
 mq_warp_client_out() { # 需先 mq_client_load
-  local ip4 ip6=""; ip4="$(mq_client_ip4 "$C_IDX")"; [ "$MQ_V6" = yes ] && ip6="$(mq_client_ip6 "$C_IDX")"
+  local ip4 ip6="" sni; ip4="$(mq_client_ip4 "$C_IDX")"; [ "$MQ_V6" = yes ] && ip6="$(mq_client_ip6 "$C_IDX")"
+  sni="$(mq_sni)"
+  mq_shadowrocket_out
+  line
   msg "${C_W}[WARP 客户端 ${C_NAME}] Mihomo / Clash.Meta（type: masque）：${C_0}"
   cat <<EOF
   - name: "MASQUE-${C_NAME}"
@@ -2468,6 +2496,7 @@ mq_warp_client_out() { # 需先 mq_client_load
 EOF
   [ -n "$ip6" ] && printf '    ipv6: %s/128\n' "$ip6"
   printf '    mtu: %s\n    udp: true\n' "$MQ_MTU"
+  [ -n "$sni" ] && printf '    sni: %s\n' "$sni"
   [ -n "$MQ_WARP_H2" ] && msg "    # 网络封 UDP 时：port 改为 ${MQ_WARP_H2}，并加一行  network: h2"
   local pem js="${MQ_CLI_DIR}/${C_NAME}.usque.json"
   pem="$(openssl x509 -in "$MQ_CERTS/server.crt" -noout -pubkey 2>/dev/null)"

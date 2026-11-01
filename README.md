@@ -83,7 +83,7 @@ rsite core       # 核心管理：Xray 升级 / sing-box 安装与升级
 
 | 模式 | 认证 | 适用客户端 |
 |---|---|---|
-| WARP 双向证书 | TLS 双向认证（mTLS）：客户端 ECDSA P-256 私钥做客户端证书，服务端按公钥白名单放行；客户端固定服务端 ECDSA 公钥。与 Cloudflare WARP 的 MASQUE 规范一致（`cf-connect-ip`） | mihomo（`type: masque`）、usque 等 |
+| WARP 双向证书 | TLS 双向认证（mTLS）：客户端 ECDSA P-256 私钥做客户端证书，服务端按公钥白名单放行；客户端固定服务端 ECDSA 公钥。与 Cloudflare WARP 的 MASQUE 规范一致（`cf-connect-ip`） | Shadowrocket（小火箭，类型 MASQUE）、mihomo（`type: masque`）、usque 等 |
 | RFC 账号密码 | HTTP Basic（`Proxy-Authorization`），RFC 9484 CONNECT-IP / RFC 9298 CONNECT-UDP，可选 stealth（未认证一律 404） | Surge、Xray `masque` 出站等 |
 
 **部署前检查**（每次部署自动执行）：
@@ -98,6 +98,7 @@ rsite core       # 核心管理：Xray 升级 / sing-box 安装与升级
 
 - 证书可复用 Reality 站点的 ECC 证书（acme.sh 续签后通过 `rsite cert-hook` 自动同步并重载；acme.sh 续签默认复用私钥，WARP 客户端固定的公钥不变），或使用 10 年自签 ECDSA 证书（RFC 客户端用 SHA-256 指纹固定）。
 - CONNECT-IP 需要 IP 转发与 NAT：由 `rsite-masque-nat.service` 开机加载（带注释的 iptables 规则，可整体撤销；默认禁止隧道访问内网；MSS 钳制；开启 IPv6 转发前把出口网卡设为 `accept_ra=2`，避免丢失 IPv6 默认路由）。
+- WARP 客户端输出里的 SNI 默认填自己的域名（站点证书域名或 Reality 域名），不用 WARP 官方的 `consumer-masque.cloudflareclient.com`（国内被封，且指向非 Cloudflare IP 更显眼）；客户端只校验固定的服务端公钥，SNI 不影响连接。
 - WARP 客户端可随时新增 / 吊销（每台设备一对密钥、固定隧道地址）；RFC 模式可改密码。
 - 云服务商安全组记得放行对应 **UDP** 端口。
 
