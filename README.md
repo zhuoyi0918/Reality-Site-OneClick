@@ -1,6 +1,6 @@
 # Reality-Site-OneClick
 
-nginx 伪装站 + VLESS Reality（**自有域名做 target**）一键部署脚本。终端交互菜单，不依赖 S-UI 等面板。可选在同机加挂 **mieru**、**VLESS Encryption**、**MASQUE**（WARP 双向证书 / RFC 账号密码）节点，并提供 **Xray 升级、sing-box 安装与升级**。
+nginx 伪装站 + VLESS Reality（**自有域名做 target**）一键部署脚本。终端交互菜单，不依赖 S-UI 等面板。可选在同机加挂 **Shadowsocks 2022**、**mieru**、**VLESS Encryption**、**MASQUE**（WARP 双向证书 / RFC 账号密码）节点，并提供 **Xray 升级、sing-box 安装与升级**。
 
 输入 Cloudflare Token、域名、IP、端口 → 自动完成 DNS（灰云）→ acme.sh DNS-01 证书 → nginx 回落站 → Xray Reality → 输出 `vless://` 链接、二维码、Mihomo / sing-box 配置。
 
@@ -26,7 +26,8 @@ rl               # 等同 rsite
 rsite install    # 直接进入部署向导
 rsite link       # 节点链接 / 二维码 / 客户端配置
 rsite doctor     # 诊断
-rsite masque     # MASQUE 客户端配置（mihomo / usque / Surge / Xray）
+rsite masque     # MASQUE 客户端配置（小火箭 / mihomo / usque / Surge / Xray）
+rsite ss         # Shadowsocks 2022 链接 / 客户端配置
 rsite core       # 核心管理：Xray 升级 / sing-box 安装与升级
 ```
 
@@ -68,14 +69,15 @@ rsite core       # 核心管理：Xray 升级 / sing-box 安装与升级
    - TCP / 内核参数调优（BBR+fq、缓冲区、TCP Fast Open、连接数、文件句柄上限）
    - SSH：改端口、生成 ed25519 密钥、仅密钥登录（无密钥时可一键生成，私钥仅显示一次）
    - UFW 防火墙、fail2ban、仅开启 BBR
-9. 其他协议：mieru / VLESS Encryption（与 Reality 各自独立，互不影响）
+9. 其他协议：VLESS Encryption / SS2022 / mieru / MASQUE（与 Reality 各自独立，互不影响）
    - VLESS Encryption：Xray `mlkem768x25519plus`（抗量子混合加密，无 TLS、无流控），认证可选 x25519 / mlkem768，输出 `vless://` 链接
    - mieru：官方 mita 服务端，自定义用户名 / 密码 / MTU，可选流量伪装（trafficPattern，降低流量特征：关闭 / 保守 / 激进，需 mita ≥3.28.0），输出 `mierus://` 链接与 mieru 客户端 JSON
+   - Shadowsocks 2022：Xray 独立服务 `xray-ss`（未安装 Xray 时先自动安装），加密可选 `2022-blake3-aes-128-gcm` / `2022-blake3-aes-256-gcm` / `2022-blake3-chacha20-poly1305`（按 CPU 是否支持 AES 指令给出默认推荐），密钥自动生成并校验长度，TCP+UDP 或仅 TCP，部署前检查 TCP/UDP 端口冲突；输出 SIP002 `ss://` 链接（另附 base64 写法）、二维码、Mihomo / sing-box / Surge 配置。SS 为全加密协议，国内直连易被识别，更适合中转 / 落地或备用
    - MASQUE：HTTP/3 CONNECT-IP（RFC 9484），两种认证可单独或同时部署（见下文）
 10. 核心管理：Xray 升级（正式版 / 预发布版 / 指定版本，失败自动回滚）、sing-box 安装与升级（正式版 / 预发布版 / 指定版本）、卸载 sing-box、升级 masque-server
 11. 卸载
 
-> 其他协议可与 Reality 共存于同一台机器，各用各的端口与 systemd 服务（`xray-venc`、`rsite-mita`、`masque`、`rsite-masque-nat`）。VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+，sing-box 暂不支持）。
+> 其他协议可与 Reality 共存于同一台机器，各用各的端口与 systemd 服务（`xray-venc`、`xray-ss`、`rsite-mita`、`masque`、`rsite-masque-nat`）。VLESS Encryption 需较新客户端（Xray 25.x+ / Mihomo 1.19.30+，sing-box 暂不支持）。
 
 ## MASQUE
 

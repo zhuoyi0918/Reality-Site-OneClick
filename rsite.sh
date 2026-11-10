@@ -13,6 +13,7 @@
 #    rsite link               # 显示节点链接 / 二维码 / Mihomo 配置
 #    rsite doctor             # 诊断
 #    rsite masque             # 显示 MASQUE 客户端配置
+#    rsite ss                 # 显示 Shadowsocks 2022 链接
 #    rsite core               # 核心管理：Xray 升级 / sing-box 安装与升级
 #
 #  支持: Debian 11+ / Ubuntu 20.04+ (x86_64 / arm64)，需 root
@@ -20,7 +21,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.4.1"
+RSITE_VERSION="1.5.0"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -1071,7 +1072,7 @@ xray_upgrade() {
     err "Xray 安装脚本失败："; msg "$out" | tail -n 8; return 1
   fi
   [ -x "$XRAY_BIN" ] || { err "未找到 $XRAY_BIN"; return 1; }
-  for c in "$XRAY_CONF" "$VENC_CONF"; do
+  for c in "$XRAY_CONF" "$VENC_CONF" "$SS_CONF"; do
     [ -s "$c" ] || continue
     if ! "$XRAY_BIN" run -test -c "$c" >/dev/null 2>&1; then
       warn "新核心无法通过配置测试: $c"; bad=1
@@ -1080,14 +1081,14 @@ xray_upgrade() {
   if [ "$bad" = 1 ] && [ -s "$bak" ]; then
     if confirm "是否回滚到旧版本 ${old}？" y; then
       install -m 755 "$bak" "$XRAY_BIN"
-      systemctl restart xray 2>/dev/null; systemctl try-restart "$VENC_SVC" 2>/dev/null
+      systemctl restart xray 2>/dev/null; systemctl try-restart "$VENC_SVC" "$SS_SVC" 2>/dev/null
       warn "已回滚到 $(xray_ver_now)"; return 1
     fi
   fi
   # Reality：重新生成配置（新核心可能支持 limitFallback 等新字段）
   if state_load && is_deployed; then apply_xray || return 1
   else systemctl try-restart xray 2>/dev/null || true; fi
-  systemctl try-restart "$VENC_SVC" 2>/dev/null || true
+  systemctl try-restart "$VENC_SVC" "$SS_SVC" 2>/dev/null || true
   ok "Xray: ${old:-无} → $(xray_ver_now)"
 }
 
@@ -1513,13 +1514,14 @@ harden_menu() {
 uninstall() {
   state_load || true
   title "卸载"
-  warn "将删除：Xray（含配置）、nginx 站点配置 rsite.conf、证书续签任务、VLESS-Enc / mieru / MASQUE、rsite 状态与命令。"
+  warn "将删除：Xray（含配置）、nginx 站点配置 rsite.conf、证书续签任务、VLESS-Enc / SS2022 / mieru / MASQUE、rsite 状态与命令。"
   msg "保留：nginx 软件包、sing-box、UFW 规则、SSH 设置、网站目录（会单独询问）。"
   confirm "确定卸载？" n || return 0
   systemctl disable --now xray >/dev/null 2>&1
   # 一并清理其他协议（若存在）
   systemctl disable --now "$VENC_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${VENC_SVC}.service"; rm -rf "$VENC_DIR" "$VENC_STATE" "${RSITE_DIR}/venc-link.txt"
   systemctl disable --now "$MIERU_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${MIERU_SVC}.service"; rm -rf "$MIERU_DIR" "$MIERU_STATE" "${RSITE_DIR}/mieru-link.txt"
+  systemctl disable --now "$SS_SVC" >/dev/null 2>&1; rm -f "/etc/systemd/system/${SS_SVC}.service"; rm -rf "$SS_DIR" "$SS_STATE" "${RSITE_DIR}/ss-link.txt"
   [ -f "$MQ_STATE" ] && mq_purge quiet
   systemctl daemon-reload 2>/dev/null || true
   bash -c "$(curl -fsSL "$XRAY_INSTALL_URL")" @ remove --purge >/dev/null 2>&1 || rm -f "$XRAY_BIN"
@@ -1705,6 +1707,207 @@ venc_remove() {
   rm -f "/etc/systemd/system/${VENC_SVC}.service"; systemctl daemon-reload
   rm -rf "$VENC_DIR" "$VENC_STATE" "${RSITE_DIR}/venc-link.txt"
   ok "已删除 VLESS Encryption"
+}
+
+# ---------------------------------------------------------------- Shadowsocks 2022（Xray）
+# 独立的 xray-ss 服务与配置，不影响 Reality / VLESS-Enc
+SS_DIR="/usr/local/etc/xray-ss"
+SS_CONF="${SS_DIR}/config.json"
+SS_SVC="xray-ss"
+SS_STATE="${RSITE_DIR}/ss.env"
+SS_KEYS="SS_PORT SS_METHOD SS_PASS SS_ADDR SS_NODE SS_NET SS_BLOCK_CN"
+# 可选加密：方法 / 密钥字节数 / 说明
+SS_METHODS="2022-blake3-aes-128-gcm:16:AES-128-GCM（有 AES-NI 的 x86 首选，最快）
+2022-blake3-aes-256-gcm:32:AES-256-GCM（更长密钥）
+2022-blake3-chacha20-poly1305:32:ChaCha20-Poly1305（ARM / 无 AES 指令的 CPU 更快）"
+
+ss_defaults() { SS_PORT=""; SS_METHOD=""; SS_PASS=""; SS_ADDR=""; SS_NODE="SS2022"; SS_NET="tcp,udp"; SS_BLOCK_CN="yes"; }
+ss_load() {
+  ss_defaults; [ -f "$SS_STATE" ] || return 1
+  local k v
+  while IFS='=' read -r k v; do
+    case " $SS_KEYS " in *" $k "*) ;; *) continue ;; esac
+    v="${v#\'}"; v="${v%\'}"; printf -v "$k" '%s' "$v"
+  done <"$SS_STATE"; return 0
+}
+ss_save() {
+  mkdir -p "$RSITE_DIR" && chmod 700 "$RSITE_DIR"
+  local k tmp="${SS_STATE}.tmp"; : >"$tmp" && chmod 600 "$tmp"
+  for k in $SS_KEYS; do printf "%s='%s'\n" "$k" "${!k}" >>"$tmp"; done
+  mv -f "$tmp" "$SS_STATE"
+}
+ss_deployed() { [ -f "$SS_STATE" ] && [ -f "$SS_CONF" ] && [ -x "$XRAY_BIN" ]; }
+ss_keylen() { printf '%s\n' "$SS_METHODS" | awk -F: -v m="$1" '$1==m{print $2}'; }
+ss_valid_key() { # ss_valid_key 方法 密钥 —— 必须是 base64 且解码后长度与算法一致
+  local n; n="$(ss_keylen "$1")"; [ -n "$n" ] || return 1
+  [[ "$2" =~ ^[A-Za-z0-9+/]+={0,2}$ ]] || return 1
+  [ "$(printf '%s' "$2" | base64 -d 2>/dev/null | wc -c)" = "$n" ]
+}
+ss_gen_key() { openssl rand -base64 "$(ss_keylen "$1")" | tr -d '\n'; }
+ss_has_aes() { grep -qwm1 aes /proc/cpuinfo 2>/dev/null || grep -qiE 'Features.*\baes\b' /proc/cpuinfo 2>/dev/null; }
+
+ss_gen_config() {
+  mkdir -p "$SS_DIR"
+  jq -n --argjson port "$SS_PORT" --arg m "$SS_METHOD" --arg pw "$SS_PASS" --arg net "$SS_NET" \
+     --argjson cn "$([ "$SS_BLOCK_CN" = yes ] && echo true || echo false)" '
+  {
+    log:{loglevel:"warning", access:"none"},
+    inbounds:[{
+      tag:"ss-in", listen:"0.0.0.0", port:$port, protocol:"shadowsocks",
+      settings:{method:$m, password:$pw, network:$net},
+      sniffing:{enabled:true, destOverride:["http","tls","quic"], routeOnly:true}
+    }],
+    outbounds:[{tag:"direct",protocol:"freedom"},{tag:"block",protocol:"blackhole"}],
+    routing:{domainStrategy:"AsIs", rules:(
+      [{type:"field",ip:["geoip:private"],outboundTag:"block"},
+       {type:"field",protocol:["bittorrent"],outboundTag:"block"}]
+      + (if $cn then [{type:"field",ip:["geoip:cn"],outboundTag:"block"}] else [] end))}
+  }' >"${SS_CONF}.tmp" || return 1
+  chmod 600 "${SS_CONF}.tmp"; mv -f "${SS_CONF}.tmp" "$SS_CONF"
+}
+
+ss_write_service() {
+  cat >/etc/systemd/system/${SS_SVC}.service <<EOF
+[Unit]
+Description=Xray Shadowsocks-2022 (rsite)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${XRAY_BIN} run -c ${SS_CONF}
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+}
+
+# SIP002：2022 系列的 userinfo 用百分号编码（不用 base64）
+ss_link()     { printf 'ss://%s@%s:%s#%s' "$(urlenc "${SS_METHOD}:${SS_PASS}")" "$(link_host "$SS_ADDR")" "$SS_PORT" "$(urlenc "$SS_NODE")"; }
+ss_link_b64() { printf 'ss://%s@%s:%s#%s' "$(printf '%s' "${SS_METHOD}:${SS_PASS}" | base64 -w0 | tr '+/' '-_' | tr -d '=')" "$(link_host "$SS_ADDR")" "$SS_PORT" "$(urlenc "$SS_NODE")"; }
+
+ss_show() {
+  ss_load || { warn "尚未部署 Shadowsocks 2022"; return 1; }
+  local link udp=false; link="$(ss_link)"; [[ "$SS_NET" == *udp* ]] && udp=true
+  title "Shadowsocks 2022 节点"
+  kv "节点名" "$SS_NODE" "连接地址" "$SS_ADDR" "端口" "${SS_PORT}（${SS_NET}）" \
+     "加密" "$SS_METHOD" "密钥" "$SS_PASS" "服务" "$(systemctl is-active "$SS_SVC" 2>/dev/null)"
+  line
+  msg "${C_W}ss:// 链接（SIP002，小火箭 / v2rayN / NekoBox 等直接导入）：${C_0}"; msg "${C_G}${link}${C_0}"
+  msg "${C_W}旧客户端导入失败时用 base64 写法：${C_0}"; msg "$(ss_link_b64)"
+  line
+  command -v qrencode >/dev/null 2>&1 && qrencode -t ANSIUTF8 -m 1 "$link"
+  line
+  msg "${C_W}Mihomo / Clash.Meta：${C_0}"
+  cat <<EOF
+  - name: "${SS_NODE}"
+    type: ss
+    server: ${SS_ADDR}
+    port: ${SS_PORT}
+    cipher: ${SS_METHOD}
+    password: "${SS_PASS}"
+    udp: ${udp}
+EOF
+  line
+  msg "${C_W}sing-box outbound：${C_0}"
+  jq -n --arg tag "$SS_NODE" --arg s "$SS_ADDR" --argjson p "$SS_PORT" --arg m "$SS_METHOD" --arg pw "$SS_PASS" \
+     '{type:"shadowsocks", tag:$tag, server:$s, server_port:$p, method:$m, password:$pw}'
+  line
+  msg "${C_W}Surge：${C_0}"
+  printf '%s = ss, %s, %s, encrypt-method=%s, password="%s", udp-relay=%s\n' "$SS_NODE" "$SS_ADDR" "$SS_PORT" "$SS_METHOD" "$SS_PASS" "$udp"
+  ( umask 077; printf '%s\n' "$link" >"${RSITE_DIR}/ss-link.txt" )
+  msg ""
+  msg "提示：SS2022 需较新客户端（Xray 1.8+ / sing-box 1.1+ / Mihomo / 小火箭 / Surge 5）。"
+  warn "SS 是全加密协议，国内直连容易被识别封锁，更适合做中转 / 落地或备用；主力仍建议 Reality。"
+}
+
+ss_deploy() {
+  ss_load || true
+  title "部署 Shadowsocks 2022（Xray）"
+  # 1. Xray：没有就先装
+  if [ -x "$XRAY_BIN" ]; then
+    ok "已检测到 Xray: $("$XRAY_BIN" version 2>/dev/null | head -n1)"
+  else
+    info "未检测到 Xray，先安装 Xray"
+    apt_install curl jq unzip >/dev/null || return 1
+    install_xray || return 1
+  fi
+  apt_install jq openssl qrencode >/dev/null || return 1
+
+  # 2. 地址 / 端口（TCP 与 UDP 都检查冲突）
+  [ -z "$SS_ADDR" ] && { state_load 2>/dev/null; SS_ADDR="${CONNECT_ADDR:-${SERVER_IP:-$(detect_ip || true)}}"; }
+  while :; do
+    ask SS_ADDR "客户端连接地址（IP 或域名）" "$SS_ADDR"
+    valid_ipv4 "$SS_ADDR" || valid_ipv6 "$SS_ADDR" || valid_domain "$SS_ADDR" && break; warn "地址无效"
+  done
+  [ -z "$SS_PORT" ] && SS_PORT="$(shuf -i 20000-59999 -n1 2>/dev/null || echo 28388)"
+  while :; do ask SS_PORT "对外端口（建议高位随机端口，避开 8388 等常见端口）" "$SS_PORT"; valid_port "$SS_PORT" && break; warn "端口无效"; done
+  local tmp
+  msg "传输: 1) TCP + UDP（默认）  2) 仅 TCP"
+  ask tmp "选择" "$([ "$SS_NET" = tcp ] && echo 2 || echo 1)"
+  [ "$tmp" = 2 ] && SS_NET=tcp || SS_NET="tcp,udp"
+  mq_port_check SS_PORT tcp "SS2022" ss || { warn "已取消"; return 1; }
+  if [[ "$SS_NET" == *udp* ]]; then
+    mq_port_check SS_PORT udp "SS2022" ss || { warn "已取消"; return 1; }
+  fi
+
+  # 3. 加密算法
+  local i=0 def=1 m n d old="$SS_METHOD"
+  ss_has_aes || def=3
+  msg "加密算法（本机 $(ss_has_aes && echo '支持 AES 指令' || echo '不支持 AES 指令，推荐 ChaCha20')）："
+  while IFS=: read -r m n d; do
+    i=$((i+1)); msg "  ${i}) ${m}  —— ${d}，密钥 ${n} 字节"
+    [ "$m" = "$SS_METHOD" ] && def="$i"
+  done <<<"$SS_METHODS"
+  ask tmp "选择 [1-3]" "$def"
+  case "$tmp" in 2|3) ;; *) tmp=1 ;; esac
+  SS_METHOD="$(printf '%s\n' "$SS_METHODS" | sed -n "${tmp}p" | cut -d: -f1)"
+  # 换了算法，旧密钥长度可能不匹配
+  [ "$old" != "$SS_METHOD" ] && SS_PASS=""
+  ss_valid_key "$SS_METHOD" "$SS_PASS" || SS_PASS="$(ss_gen_key "$SS_METHOD")"
+  while :; do
+    ask SS_PASS "密钥（base64，${SS_METHOD} 需 $(ss_keylen "$SS_METHOD") 字节；回车用随机）" "$SS_PASS"
+    ss_valid_key "$SS_METHOD" "$SS_PASS" && break
+    warn "密钥必须是 base64 编码、解码后正好 $(ss_keylen "$SS_METHOD") 字节；可用 openssl rand -base64 $(ss_keylen "$SS_METHOD") 生成"
+  done
+  ask SS_NODE "节点名称" "$SS_NODE"; valid_name "$SS_NODE" || SS_NODE="SS2022"
+  confirm "拦截回国流量 geoip:cn？" "$([ "$SS_BLOCK_CN" = yes ] && echo y || echo n)" && SS_BLOCK_CN=yes || SS_BLOCK_CN=no
+
+  title "确认 SS2022 配置"
+  kv "地址" "$SS_ADDR" "端口" "${SS_PORT}（${SS_NET}）" "加密" "$SS_METHOD" "节点名" "$SS_NODE" "geoip:cn 拦截" "$SS_BLOCK_CN"
+  line
+  confirm "开始部署？" y || { warn "已取消"; return 1; }
+
+  ss_gen_config || { err "生成配置失败"; return 1; }
+  if ! "$XRAY_BIN" run -test -c "$SS_CONF" >/dev/null 2>&1; then
+    err "配置测试失败："; "$XRAY_BIN" run -test -c "$SS_CONF" 2>&1 | tail -3; return 1
+  fi
+  ss_write_service
+  ss_save
+  systemctl enable "$SS_SVC" >/dev/null 2>&1
+  systemctl restart "$SS_SVC" || { err "启动失败: journalctl -u $SS_SVC -n 30"; return 1; }
+  sleep 1
+  systemctl is-active --quiet "$SS_SVC" || { err "未运行: journalctl -u $SS_SVC -n 30"; return 1; }
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    ufw allow "${SS_PORT}/tcp" >/dev/null
+    [[ "$SS_NET" == *udp* ]] && ufw allow "${SS_PORT}/udp" >/dev/null
+    ok "UFW 已放行 ${SS_PORT}（${SS_NET}）"
+  fi
+  ok "Shadowsocks 2022 已部署，监听 0.0.0.0:${SS_PORT}（${SS_NET}，${SS_METHOD}）"
+  ss_show
+}
+
+ss_remove() {
+  ss_load || { warn "未部署 Shadowsocks 2022"; return 0; }
+  confirm "删除 Shadowsocks 2022 节点（不影响 Reality / 其他协议）？" n || return 0
+  systemctl disable --now "$SS_SVC" >/dev/null 2>&1
+  rm -f "/etc/systemd/system/${SS_SVC}.service"; systemctl daemon-reload
+  rm -rf "$SS_DIR" "$SS_STATE" "${RSITE_DIR}/ss-link.txt"
+  ok "已删除 Shadowsocks 2022（Xray 核心保留）"
 }
 
 # ---------------------------------------------------------------- mieru
@@ -2334,7 +2537,7 @@ mq_listen_summary() {
 }
 
 # ---------------------------------------------------------------- 部署前检查：端口 / 协议冲突
-# 输出 rsite 自己占用/预留的端口：「端口 说明」；第二个参数是正在配置的 MASQUE 模式（排除自身）
+# 输出 rsite 自己占用/预留的端口：「端口 说明」；第二个参数是正在配置的协议（warp|rfc|ss，排除自身）
 # 在子 shell 里读取各状态文件，避免覆盖部署向导中正在填写的变量
 mq_reserved() ( # mq_reserved tcp|udp warp|rfc
   proto="$1"; self="$2"
@@ -2344,10 +2547,12 @@ mq_reserved() ( # mq_reserved tcp|udp warp|rfc
     fi
     venc_load && venc_deployed && printf '%s VLESS-Encryption\n' "$VENC_PORT"
     mieru_load && mieru_deployed && printf '%s mieru\n' "$MIERU_PORT"
+    [ "$self" != ss ] && ss_load && ss_deployed && printf '%s Shadowsocks-2022\n' "$SS_PORT"
     mq_load
     [ "$self" != warp ] && [ "$MQ_WARP" = yes ] && [ -n "$MQ_WARP_H2" ] && printf '%s MASQUE-WARP(h2)\n' "$MQ_WARP_H2"
     [ "$self" != rfc ] && [ "$MQ_RFC" = yes ] && [ -n "$MQ_RFC_H2" ] && printf '%s MASQUE-RFC(h2)\n' "$MQ_RFC_H2"
   else
+    [ "$self" != ss ] && ss_load && ss_deployed && [[ "$SS_NET" == *udp* ]] && printf '%s Shadowsocks-2022\n' "$SS_PORT"
     mq_load
     [ "$self" != warp ] && [ "$MQ_WARP" = yes ] && printf '%s MASQUE-WARP\n' "$MQ_WARP_PORT"
     [ "$self" != rfc ] && [ "$MQ_RFC" = yes ] && printf '%s MASQUE-RFC\n' "$MQ_RFC_PORT"
@@ -2362,7 +2567,11 @@ mq_port_conflict() { # tcp|udp 端口 模式
     [ "$rp" = "$p" ] && { printf 'rsite:%s' "$rl"; return 0; }
   done < <(mq_reserved "$proto" "$self")
   if [ "$proto" = udp ]; then o="$(port_owner_udp "$p")"; else o="$(port_owner "$p")"; fi
-  [ -n "$o" ] && [ "$o" != masque-server ] && printf 'proc:%s' "$o"
+  [ -n "$o" ] || return 0
+  # 重新部署时忽略「自己」：MASQUE 的 masque-server、SS2022 的 xray-ss
+  [ "$o" = masque-server ] && [ "$self" != ss ] && return 0
+  if [ "$self" = ss ] && [ "$(pid_unit "$(port_pid "$proto" "$p")")" = "${SS_SVC}.service" ]; then return 0; fi
+  printf 'proc:%s' "$o"
   return 0
 }
 
@@ -2394,7 +2603,7 @@ mq_port_check() {
         msg "     （占用者是本机 Reality，不建议停止）"
         __unit=""
       else
-        msg "  2) 停止并禁用占用者「${__unit}」，把端口让给 MASQUE"
+        msg "  2) 停止并禁用占用者「${__unit}」，让出端口"
       fi
     fi
     msg "  3) 忽略冲突继续（服务大概率启动失败）"
@@ -2773,11 +2982,12 @@ mq_status() {
 # ---------------------------------------------------------------- 子菜单
 other_menu() {
   while :; do
-    local vs ms
+    local vs ms ss
     vs="$(venc_deployed && systemctl is-active "$VENC_SVC" 2>/dev/null || echo 未部署)"
     ms="$(mieru_deployed && systemctl is-active "$MIERU_SVC" 2>/dev/null || echo 未部署)"
-    title "其他协议：mieru / VLESS Encryption / MASQUE"
-    msg "VLESS Encryption: ${vs}    mieru: ${ms}"
+    ss="$(ss_deployed && systemctl is-active "$SS_SVC" 2>/dev/null || echo 未部署)"
+    title "其他协议：VLESS Encryption / SS2022 / mieru / MASQUE"
+    msg "VLESS Encryption: ${vs}    SS2022: ${ss}    mieru: ${ms}"
     msg "MASQUE: $(mq_status)"
     msg ""
     msg "  1) 部署 / 重装 VLESS Encryption"
@@ -2787,6 +2997,10 @@ other_menu() {
     msg "  5) 查看 mieru 链接"
     msg "  6) 删除 mieru"
     msg "  7) 重启以上全部服务"
+    msg "  ---- Shadowsocks 2022（Xray，未安装 Xray 时自动安装）----"
+    msg " 14) 部署 / 重装 SS2022（可选 AES-128 / AES-256 / ChaCha20）"
+    msg " 15) 查看 SS2022 链接"
+    msg " 16) 删除 SS2022"
     msg "  ---- MASQUE（HTTP/3 CONNECT-IP，可与 Reality 共用 443：UDP vs TCP）----"
     msg "  8) 部署 MASQUE · WARP 双向证书模式（mTLS，ECDSA P-256 公私钥对）"
     msg "  9) 部署 MASQUE · RFC 标准账号密码模式（HTTP Basic）"
@@ -2795,7 +3009,7 @@ other_menu() {
     msg " 12) MASQUE 诊断"
     msg " 13) 删除 MASQUE"
     msg "  0) 返回"
-    local c; ask c "请选择 [0-13]" ""
+    local c; ask c "请选择 [0-16]" ""
     case "$c" in
       1) venc_deploy ;;
       2) venc_show ;;
@@ -2804,6 +3018,7 @@ other_menu() {
       5) mieru_show ;;
       6) mieru_remove ;;
       7) systemctl restart "$VENC_SVC" 2>/dev/null; systemctl restart "$MIERU_SVC" 2>/dev/null
+         ss_deployed && systemctl restart "$SS_SVC" 2>/dev/null
          mq_load && mq_any && systemctl restart "$MQ_NAT_SVC" "$MQ_SVC" 2>/dev/null; ok "已尝试重启" ;;
       8) mq_deploy warp ;;
       9) mq_deploy rfc ;;
@@ -2811,6 +3026,9 @@ other_menu() {
       11) mq_client_menu ;;
       12) mq_doctor ;;
       13) mq_remove ;;
+      14) ss_deploy ;;
+      15) ss_show ;;
+      16) ss_remove ;;
       0) return 0 ;;
       *) warn "无效选择" ;;
     esac
@@ -2841,7 +3059,7 @@ main_menu() {
     msg "  6) 服务管理"
     msg "  7) 防偷跑 / 访问统计"
     msg "  8) 系统优化 / 加固（更新源/DNS/TCP/SSH/UFW/BBR）"
-    msg "  9) 其他协议：mieru / VLESS Encryption / MASQUE"
+    msg "  9) 其他协议：VLESS Encryption / SS2022 / mieru / MASQUE"
     msg " 10) 核心管理：Xray 升级 / sing-box 安装与升级"
     msg " 11) 卸载"
     msg "  0) 退出"
@@ -2877,13 +3095,14 @@ main() {
     link) show_node ;;
     doctor) doctor ;;
     masque) mq_show ;;
+    ss) ss_show ;;
     core) apt_install curl jq >/dev/null || exit 1; core_menu ;;
     cert-hook) cert_hook ;;                 # acme.sh 续签后调用
     masque-nat) mq_nat "${2:-up}" ;;        # rsite-masque-nat.service 调用
     -v|--version) msg "$RSITE_VERSION" ;;
     -h|--help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//' ;;
     "") apt_install curl jq || exit 1; main_menu ;;
-    *) err "未知参数: $1（可用: install / link / doctor / masque / core）"; exit 1 ;;
+    *) err "未知参数: $1（可用: install / link / doctor / masque / ss / core）"; exit 1 ;;
   esac
 }
 
