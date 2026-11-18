@@ -21,7 +21,7 @@
 
 set -o pipefail
 
-RSITE_VERSION="1.5.0"
+RSITE_VERSION="1.5.1"
 RSITE_DIR="/etc/rsite"
 RSITE_STATE="${RSITE_DIR}/rsite.env"
 RSITE_BACKUP="${RSITE_DIR}/backup"
@@ -412,8 +412,29 @@ acme_install_cert() {
   chmod 600 "$(cert_dir)/key.pem"
 }
 
+# 重新部署前移走当前域名的 ECC 缓存，避免卸载后残留私钥阻止再次签发。
+# 备份位于 acme.sh 目录内，权限仅 root 可读；其他域名和 account.conf 保持不变。
+acme_reset_domain() {
+  valid_domain "$DOMAIN" || { err "域名无效，拒绝清理证书缓存"; return 1; }
+  local acme_home cache backup
+  acme_home="$(dirname "$ACME")"
+  cache="${acme_home}/${DOMAIN}_ecc"
+  [ -e "$cache" ] || [ -L "$cache" ] || return 0
+  backup="$(mktemp -d "${acme_home}/rsite-cert-backup.${DOMAIN}.XXXXXX")" || {
+    err "无法创建旧证书备份目录，停止签发"; return 1;
+  }
+  chmod 700 "$backup" && mv -- "$cache" "${backup}/${DOMAIN}_ecc" || {
+    err "备份旧证书失败，停止签发"; return 1;
+  }
+  info "已清理 ${DOMAIN} 的旧 ECC 证书缓存；备份: ${backup}"
+  # nginx 当前使用的证书保留到新证书签发成功，再由 --install-cert 替换。
+}
+
 issue_cert() {
   acme_install || return 1
+  if [ "${1:-}" = fresh ]; then
+    acme_reset_domain || return 1
+  fi
   # 附录 A：清掉 account.conf 里写死的旧 Zone/Account ID，避免 count:0 类错误
   [ -f /root/.acme.sh/account.conf ] && sed -i '/SAVED_CF_Zone_ID\|SAVED_CF_Account_ID/d' /root/.acme.sh/account.conf
   local rc=0 force=()
@@ -893,10 +914,10 @@ deploy() {
   systemctl enable --now nginx >/dev/null 2>&1 || true
   if [ -n "${CF_TOKEN:-}" ]; then
     if [ -n "$old_domain" ] && [ "$old_domain" != "$DOMAIN" ]; then
-      issue_cert force || return 1
+      issue_cert fresh || return 1
       "$ACME" --remove -d "$old_domain" --ecc >/dev/null 2>&1 && info "已移除旧域名 ${old_domain} 的续签任务"
     else
-      issue_cert || return 1
+      issue_cert fresh || return 1
     fi
   else
     cert_ok || { err "没有可用证书，且未提供 Token"; return 1; }
