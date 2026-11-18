@@ -1,0 +1,44 @@
+name: Publish release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - rsite.sh
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check script and publish versioned assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n rsite.sh
+          version="$(sed -n 's/^RSITE_VERSION="\([0-9][0-9.]*\)"$/\1/p' rsite.sh)"
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Invalid RSITE_VERSION"; exit 1; }
+          tag="v$version"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists; leaving it unchanged."
+            exit 0
+          fi
+          sha256sum rsite.sh lianliankan.html > SHA256SUMS
+          gh release create "$tag" rsite.sh lianliankan.html SHA256SUMS \
+            --target "$GITHUB_SHA" --title "$tag" --generate-notes --latest
